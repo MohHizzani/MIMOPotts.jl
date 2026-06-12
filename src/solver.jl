@@ -5,6 +5,7 @@ export save_mimo_potts_results, load_mimo_potts_results
 
 using LinearAlgebra
 using Random
+using Base.Threads: @threads, nthreads
 using DataFrames
 using JLD2
 const _MIMO_POTTS_NPZ_PKGID = Base.PkgId(Base.UUID("15e1cf62-19b3-5cfa-8e77-841668bca605"), "NPZ")
@@ -385,6 +386,91 @@ function _subproblem_terms(H::AbstractMatrix, y::AbstractVector, branch::MIMOPot
     return G, h, const_term
 end
 
+
+_backend_val(backend) = Val(Symbol(backend))
+_mimo_backend_available(::Val{:cpu}) = true
+_mimo_backend_available(_) = false
+
+function _check_mimo_backend(backend)
+    val = _backend_val(backend)
+    if !_mimo_backend_available(val)
+        error("MIMO Potts backend $(Symbol(backend)) is not available. Use backend=:cpu, or load CUDA.jl before requesting backend=:cuda.")
+    end
+    return val
+end
+
+function _trial_seed(seed, snr_index::Int, instance_index::Int, branch_rank::Int, trial::Int)
+    if isnothing(seed)
+        return rand(UInt64)
+    end
+    return UInt64(hash((seed, snr_index, instance_index, branch_rank, trial)))
+end
+
+function _potts_energy(G::AbstractMatrix, h::AbstractVector, const_term::Real, values::AbstractVector)
+    f = length(values)
+    e = Float64(const_term)
+    @inbounds for i in 1:f
+        vi = values[i]
+        row_sum = 0.0
+        for j in 1:f
+            row_sum += G[i, j] * values[j]
+        end
+        e += vi * row_sum + h[i] * vi
+    end
+    return e
+end
+
+function _recompute_gradient_energy!(grad::AbstractVector{Float64}, gx::AbstractVector{Float64},
+    G::AbstractMatrix, h::AbstractVector, const_term::Real, values::AbstractVector{Float64})
+    mul!(gx, G, values)
+    f = length(values)
+    hdot = 0.0
+    @inbounds for i in 1:f
+        grad[i] = 2.0 * gx[i] + h[i]
+        hdot += h[i] * values[i]
+    end
+    return dot(values, gx) + hdot + Float64(const_term)
+end
+
+function _apply_state_deltas!(states::AbstractVector{Int}, values::AbstractVector{Float64},
+    delta_indices::AbstractVector{Int}, delta_values::AbstractVector{Float64},
+    new_states::AbstractVector{Int}, delta_count::Int)
+    @inbounds for a in 1:delta_count
+        ia = delta_indices[a]
+        states[ia] = new_states[a]
+        values[ia] += delta_values[a]
+    end
+    return nothing
+end
+
+function _apply_deltas!(grad::AbstractVector{Float64}, states::AbstractVector{Int}, values::AbstractVector{Float64},
+    G::AbstractMatrix, delta_indices::AbstractVector{Int}, delta_values::AbstractVector{Float64},
+    new_states::AbstractVector{Int}, delta_count::Int)
+    linear = 0.0
+    quad = 0.0
+    @inbounds for a in 1:delta_count
+        ia = delta_indices[a]
+        da = delta_values[a]
+        linear += da * grad[ia]
+        for b in 1:delta_count
+            ib = delta_indices[b]
+            quad += da * G[ia, ib] * delta_values[b]
+        end
+    end
+
+    _apply_state_deltas!(states, values, delta_indices, delta_values, new_states, delta_count)
+
+    f = length(grad)
+    @inbounds for row in 1:f
+        update = 0.0
+        for a in 1:delta_count
+            update += G[row, delta_indices[a]] * delta_values[a]
+        end
+        grad[row] += 2.0 * update
+    end
+    return linear + quad
+end
+
 function _run_potts_subproblem(inst::MIMOPottsInstance, branch::MIMOPottsBranch, prep;
     H::AbstractMatrix,
     y::AbstractVector,
@@ -417,54 +503,197 @@ function _run_potts_subproblem(inst::MIMOPottsInstance, branch::MIMOPottsBranch,
     G, h, const_term = _subproblem_terms(H, y, branch, const_offset, coupling_cache)
     noise_start = Float64(noise_ratio) * _gradient_bound(G, h, levels)
 
-    states = rand(rng, 1:k, f)
-    values = levels[states]
-    best_distance = values' * G * values + dot(h, values) + const_term
-    best_states = copy(states)
+    states = Vector{Int}(undef, f)
+    values = Vector{Float64}(undef, f)
+    best_states = Vector{Int}(undef, f)
+    grad = Vector{Float64}(undef, f)
+    gx = Vector{Float64}(undef, f)
+    delta_indices = Vector{Int}(undef, f)
+    delta_values = Vector{Float64}(undef, f)
+    new_states = Vector{Int}(undef, f)
+    noise_random = Vector{Float64}(undef, f)
+    mask_random = Vector{Float64}(undef, f)
+
+    @inbounds for i in 1:f
+        state = rand(rng, 1:k)
+        states[i] = state
+        values[i] = Float64(levels[state])
+        best_states[i] = state
+    end
+
+    distance = _recompute_gradient_energy!(grad, gx, G, h, const_term, values)
+    best_distance = distance
     step_found = 0
     dau_offset = 0.0
+    batch_rate_f = Float64(batch_rate)
+    eoffset_f = Float64(eoffset)
 
     for step in 1:steps
         scale = _noise_scale(noise_stepper, noise_start, steps, step) + dau_offset
-        grad = 2.0 .* (G * values) .+ h
-        noise = scale .* (2.0 .* rand(rng, f) .- 1.0)
-        proposal_direction = ifelse.(grad .< noise, 1, -1)
-        proposed_states = clamp.(states .+ proposal_direction, 1, k)
-        changed = proposed_states .!= states
 
         if optimizer === :batch || optimizer === :batchdau
-            mask = rand(rng, f) .< Float64(batch_rate)
-            apply = changed .& mask
-            if optimizer === :batchdau
-                dau_offset = any(apply) ? 0.0 : dau_offset + Float64(eoffset)
+            delta_count = 0
+            rand!(rng, noise_random)
+            rand!(rng, mask_random)
+            @inbounds for i in 1:f
+                noise = scale * (2.0 * noise_random[i] - 1.0)
+                direction = grad[i] < noise ? 1 : -1
+                proposed = states[i] + direction
+                if proposed < 1
+                    proposed = 1
+                elseif proposed > k
+                    proposed = k
+                end
+                if proposed != states[i] && mask_random[i] < batch_rate_f
+                    delta_count += 1
+                    delta_indices[delta_count] = i
+                    delta_values[delta_count] = Float64(levels[proposed]) - values[i]
+                    new_states[delta_count] = proposed
+                end
             end
-            states[apply] .= proposed_states[apply]
+
+            if optimizer === :batchdau
+                dau_offset = delta_count == 0 ? dau_offset + eoffset_f : 0.0
+            end
+
+            if delta_count > 0
+                if f >= 32 || delta_count > max(4, f >>> 4)
+                    _apply_state_deltas!(states, values, delta_indices, delta_values, new_states, delta_count)
+                    distance = _recompute_gradient_energy!(grad, gx, G, h, const_term, values)
+                else
+                    distance += _apply_deltas!(grad, states, values, G, delta_indices, delta_values, new_states, delta_count)
+                end
+            end
         elseif optimizer === :singleflip || optimizer === :dau
-            candidates = findall(changed)
-            if isempty(candidates)
+            changed_count = 0
+            chosen_index = 0
+            chosen_state = 0
+            chosen_delta = 0.0
+            rand!(rng, noise_random)
+            @inbounds for i in 1:f
+                noise = scale * (2.0 * noise_random[i] - 1.0)
+                direction = grad[i] < noise ? 1 : -1
+                proposed = states[i] + direction
+                if proposed < 1
+                    proposed = 1
+                elseif proposed > k
+                    proposed = k
+                end
+                if proposed != states[i]
+                    changed_count += 1
+                    if rand(rng, 1:changed_count) == 1
+                        chosen_index = i
+                        chosen_state = proposed
+                        chosen_delta = Float64(levels[proposed]) - values[i]
+                    end
+                end
+            end
+
+            if changed_count == 0
                 if optimizer === :dau
-                    dau_offset += Float64(eoffset)
+                    dau_offset += eoffset_f
                 end
             else
                 dau_offset = 0.0
-                chosen = rand(rng, candidates)
-                states[chosen] = proposed_states[chosen]
+                delta_indices[1] = chosen_index
+                delta_values[1] = chosen_delta
+                new_states[1] = chosen_state
+                distance += _apply_deltas!(grad, states, values, G, delta_indices, delta_values, new_states, 1)
             end
         else
             error("Unsupported MIMO Potts optimizer $(optimizer). Use :batch, :singleflip, :dau, or :batchdau.")
         end
 
-        values = levels[states]
-        distance = values' * G * values + dot(h, values) + const_term
         if distance < best_distance
-            best_distance = distance
-            best_states .= states
-            step_found = step
+            exact_distance = _potts_energy(G, h, const_term, values)
+            if exact_distance < best_distance
+                best_distance = exact_distance
+                best_states .= states
+                step_found = step
+            end
+            distance = exact_distance
         end
     end
 
     return (; best_distance = Float64(best_distance), best_free_states = Vector{Int}(best_states),
         step_found = step_found, total_steps = steps, total_gradient_evals = steps)
+end
+
+function _run_potts_subproblem_batch_backend(::Val{:cpu}, inst::MIMOPottsInstance, branch::MIMOPottsBranch, prep;
+    H::AbstractMatrix,
+    y::AbstractVector,
+    const_offset::Real,
+    coupling_cache,
+    optimizer::Symbol,
+    num_cycles::Int,
+    cycles_scaler::Real,
+    noise_ratio::Real,
+    noise_stepper::Symbol,
+    batch_rate::Real,
+    eoffset::Real,
+    seeds::AbstractVector{UInt64},
+    gpuBatchSize::Int=256,
+    gpuFloat::Type{<:AbstractFloat}=Float32,
+)
+    return [
+        _run_potts_subproblem(inst, branch, prep;
+            H = H,
+            y = y,
+            const_offset = const_offset,
+            coupling_cache = coupling_cache,
+            optimizer = optimizer,
+            num_cycles = num_cycles,
+            cycles_scaler = cycles_scaler,
+            noise_ratio = noise_ratio,
+            noise_stepper = noise_stepper,
+            batch_rate = batch_rate,
+            eoffset = eoffset,
+            rng = MersenneTwister(seed),
+        )
+        for seed in seeds
+    ]
+end
+
+function _run_potts_subproblem_branch_batch_backend(backend_val, inst::MIMOPottsInstance, branches::AbstractVector{<:MIMOPottsBranch}, active_trials_by_branch::AbstractVector, prep;
+    H::AbstractMatrix,
+    y::AbstractVector,
+    const_offset::Real,
+    coupling_cache,
+    optimizer::Symbol,
+    num_cycles::Int,
+    cycles_scaler::Real,
+    noise_ratio::Real,
+    noise_stepper::Symbol,
+    batch_rate::Real,
+    eoffset::Real,
+    snr_index::Int,
+    instance_index::Int,
+    seed,
+    gpuBatchSize::Int=256,
+    gpuFloat::Type{<:AbstractFloat}=Float32,
+)
+    out = Vector{Any}(undef, length(branches))
+    for (i, branch) in enumerate(branches)
+        active_trials = active_trials_by_branch[i]
+        seeds = [_trial_seed(seed, snr_index, instance_index, branch.rank, trial) for trial in active_trials]
+        out[i] = _run_potts_subproblem_batch_backend(backend_val, inst, branch, prep;
+            H = H,
+            y = y,
+            const_offset = const_offset,
+            coupling_cache = coupling_cache,
+            optimizer = optimizer,
+            num_cycles = num_cycles,
+            cycles_scaler = cycles_scaler,
+            noise_ratio = noise_ratio,
+            noise_stepper = noise_stepper,
+            batch_rate = batch_rate,
+            eoffset = eoffset,
+            seeds = seeds,
+            gpuBatchSize = gpuBatchSize,
+            gpuFloat = gpuFloat,
+        )
+    end
+    return out
 end
 
 function _full_states(prep, branch::MIMOPottsBranch, free_states::Vector{Int})
@@ -474,26 +703,32 @@ function _full_states(prep, branch::MIMOPottsBranch, free_states::Vector{Int})
     return states
 end
 
-function solve_mimo_potts(path::AbstractString;
-    snr_index::Int=1,
-    instance_index::Int=1,
-    modulation=nothing,
-    free_dims::Int=4,
-    fixed_candidates_per_dim::Int=2,
-    max_branches::Int=256,
-    trials::Int=128,
-    num_cycles::Int=100,
-    cycles_scaler::Real=1.0,
-    noise_ratio::Real=1.0,
-    noise_stepper::Symbol=:linear,
-    optimizer::Symbol=:batch,
-    batch_rate::Real=0.5,
-    eoffset::Real=0.0,
-    cacheCouplings::Bool=true,
-    preprocess=:normal,
-    seed=nothing,
+
+function _solve_mimo_potts_batched(path::AbstractString, backend_val;
+    snr_index::Int,
+    instance_index::Int,
+    modulation,
+    free_dims::Int,
+    fixed_candidates_per_dim::Int,
+    max_branches::Int,
+    trials::Int,
+    num_cycles::Int,
+    cycles_scaler::Real,
+    noise_ratio::Real,
+    noise_stepper::Symbol,
+    optimizer::Symbol,
+    batch_rate::Real,
+    eoffset::Real,
+    cacheCouplings::Bool,
+    preprocess,
+    seed,
+    gpuBatchSize::Int,
+    gpuFloat::Type{<:AbstractFloat},
 )
-    rng = isnothing(seed) ? Random.default_rng() : MersenneTwister(seed)
+    if !(optimizer in (:batch, :batchdau))
+        error("backend=:cuda currently supports optimizer=:batch and optimizer=:batchdau. Use backend=:cpu for $(optimizer).")
+    end
+
     inst = load_mimo_potts_instance(path; snr_index, instance_index, modulation)
     prep = zf_mmse_preprocess(inst)
     geometry = _preprocessed_geometry(inst, preprocess)
@@ -520,64 +755,95 @@ function solve_mimo_potts(path::AbstractString;
     )
     coupling_cache = isempty(branches) ? nothing : _make_coupling_cache(geometry.H, geometry.y, branches[1].free_indices, branches[1].fixed_indices, geometry.const_offset, cacheCouplings)
 
+    current_radius = fill(initial_radius, trials)
+    trial_best_distance = fill(initial_radius, trials)
+    trial_best_states = [copy(prep.base_states) for _ in 1:trials]
+    trial_best_values = [copy(prep.base_values) for _ in 1:trials]
+
     elapsed = @elapsed begin
-        for trial in 1:trials
-            current_radius = initial_radius
-            trial_best_distance = initial_radius
-            trial_best_states = copy(prep.base_states)
-            trial_best_values = copy(prep.base_values)
+        branch_i = 1
+        while branch_i <= length(branches)
+            chunk_branches = MIMOPottsBranch[]
+            chunk_active_trials = Vector{Vector{Int}}()
+            chunk_jobs = 0
 
-            for branch in branches
-                if branch.lower_bound >= current_radius
-                    branches_pruned += 1
-                    continue
+            while branch_i <= length(branches) && (isempty(chunk_branches) || chunk_jobs < max(1, gpuBatchSize))
+                branch = branches[branch_i]
+                active_trials = [trial for trial in 1:trials if branch.lower_bound < current_radius[trial]]
+                branches_pruned += trials - length(active_trials)
+                if !isempty(active_trials)
+                    branches_visited += length(active_trials)
+                    push!(chunk_branches, branch)
+                    push!(chunk_active_trials, active_trials)
+                    chunk_jobs += length(active_trials)
                 end
-                branches_visited += 1
-                step_offset = total_steps
-                sub = _run_potts_subproblem(inst, branch, prep;
-                    H = geometry.H,
-                    y = geometry.y,
-                    const_offset = geometry.const_offset,
-                    coupling_cache = coupling_cache,
-                    optimizer = optimizer,
-                    num_cycles = num_cycles,
-                    cycles_scaler = cycles_scaler,
-                    noise_ratio = noise_ratio,
-                    noise_stepper = noise_stepper,
-                    batch_rate = batch_rate,
-                    eoffset = eoffset,
-                    rng = rng,
-                )
-                total_steps += sub.total_steps
-                total_gradient_evals += sub.total_gradient_evals
+                branch_i += 1
+            end
 
-                if sub.best_distance < trial_best_distance
-                    candidate_states = _full_states(prep, branch, sub.best_free_states)
-                    candidate_values = states_to_values(candidate_states, inst.levels)
-                    candidate_distance = mimo_distance(inst.H, inst.y, candidate_values)
-                    if candidate_distance < trial_best_distance
-                        trial_best_states = candidate_states
-                        trial_best_values = candidate_values
-                        trial_best_distance = candidate_distance
-                        current_radius = candidate_distance
-                        radius_updates += 1
+            if isempty(chunk_branches)
+                continue
+            end
 
-                        if candidate_distance < best_distance
-                            best_states = candidate_states
-                            best_values = candidate_values
-                            best_distance = candidate_distance
-                            step_found_best = step_offset + sub.step_found
-                            trial_found_best = trial
-                            branch_found_best = branch.rank
+            batch_step_offset = total_steps
+            subs_by_branch = _run_potts_subproblem_branch_batch_backend(backend_val, inst, chunk_branches, chunk_active_trials, prep;
+                H = geometry.H,
+                y = geometry.y,
+                const_offset = geometry.const_offset,
+                coupling_cache = coupling_cache,
+                optimizer = optimizer,
+                num_cycles = num_cycles,
+                cycles_scaler = cycles_scaler,
+                noise_ratio = noise_ratio,
+                noise_stepper = noise_stepper,
+                batch_rate = batch_rate,
+                eoffset = eoffset,
+                snr_index = snr_index,
+                instance_index = instance_index,
+                seed = seed,
+                gpuBatchSize = gpuBatchSize,
+                gpuFloat = gpuFloat,
+            )
+
+            job_linear = 0
+            for (branch_local_i, branch) in enumerate(chunk_branches)
+                active_trials = chunk_active_trials[branch_local_i]
+                subs = subs_by_branch[branch_local_i]
+                for (local_i, sub) in enumerate(subs)
+                    job_linear += 1
+                    trial = active_trials[local_i]
+                    total_steps += sub.total_steps
+                    total_gradient_evals += sub.total_gradient_evals
+
+                    if sub.best_distance < trial_best_distance[trial]
+                        candidate_states = _full_states(prep, branch, sub.best_free_states)
+                        candidate_values = states_to_values(candidate_states, inst.levels)
+                        candidate_distance = mimo_distance(inst.H, inst.y, candidate_values)
+                        if candidate_distance < trial_best_distance[trial]
+                            trial_best_states[trial] = candidate_states
+                            trial_best_values[trial] = candidate_values
+                            trial_best_distance[trial] = candidate_distance
+                            current_radius[trial] = candidate_distance
+                            radius_updates += 1
+
+                            if candidate_distance < best_distance
+                                best_states = candidate_states
+                                best_values = candidate_values
+                                best_distance = candidate_distance
+                                step_found_best = batch_step_offset + (job_linear - 1) * sub.total_steps + sub.step_found
+                                trial_found_best = trial
+                                branch_found_best = branch.rank
+                            end
                         end
                     end
                 end
             end
+        end
 
-            if trial_best_distance < best_distance
-                best_states = trial_best_states
-                best_values = trial_best_values
-                best_distance = trial_best_distance
+        for trial in 1:trials
+            if trial_best_distance[trial] < best_distance
+                best_states = trial_best_states[trial]
+                best_values = trial_best_values[trial]
+                best_distance = trial_best_distance[trial]
                 trial_found_best = trial
             end
         end
@@ -623,6 +889,266 @@ function solve_mimo_potts(path::AbstractString;
     )
 end
 
+function _run_cpu_trial(inst::MIMOPottsInstance, prep, geometry, branches, coupling_cache;
+    trial_seed::UInt64,
+    optimizer::Symbol,
+    num_cycles::Int,
+    cycles_scaler::Real,
+    noise_ratio::Real,
+    noise_stepper::Symbol,
+    batch_rate::Real,
+    eoffset::Real,
+)
+    rng = MersenneTwister(trial_seed)
+    current_radius = Float64(prep.base_distance)
+    trial_best_distance = Float64(prep.base_distance)
+    trial_best_states = copy(prep.base_states)
+    trial_best_values = copy(prep.base_values)
+    step_found_best = 0
+    branch_found_best = 0
+    total_steps = 0
+    total_gradient_evals = 0
+    branches_visited = 0
+    branches_pruned = 0
+    radius_updates = 0
+
+    for branch in branches
+        if branch.lower_bound >= current_radius
+            branches_pruned += 1
+            continue
+        end
+        branches_visited += 1
+        step_offset = total_steps
+        sub = _run_potts_subproblem(inst, branch, prep;
+            H = geometry.H,
+            y = geometry.y,
+            const_offset = geometry.const_offset,
+            coupling_cache = coupling_cache,
+            optimizer = optimizer,
+            num_cycles = num_cycles,
+            cycles_scaler = cycles_scaler,
+            noise_ratio = noise_ratio,
+            noise_stepper = noise_stepper,
+            batch_rate = batch_rate,
+            eoffset = eoffset,
+            rng = rng,
+        )
+        total_steps += sub.total_steps
+        total_gradient_evals += sub.total_gradient_evals
+
+        if sub.best_distance < trial_best_distance
+            candidate_states = _full_states(prep, branch, sub.best_free_states)
+            candidate_values = states_to_values(candidate_states, inst.levels)
+            candidate_distance = mimo_distance(inst.H, inst.y, candidate_values)
+            if candidate_distance < trial_best_distance
+                trial_best_states = candidate_states
+                trial_best_values = candidate_values
+                trial_best_distance = candidate_distance
+                current_radius = candidate_distance
+                radius_updates += 1
+                step_found_best = step_offset + sub.step_found
+                branch_found_best = branch.rank
+            end
+        end
+    end
+
+    return (;
+        best_distance = trial_best_distance,
+        best_states = trial_best_states,
+        best_values = trial_best_values,
+        step_found_best = step_found_best,
+        branch_found_best = branch_found_best,
+        total_steps = total_steps,
+        total_gradient_evals = total_gradient_evals,
+        branches_visited = branches_visited,
+        branches_pruned = branches_pruned,
+        radius_updates = radius_updates,
+    )
+end
+
+function solve_mimo_potts(path::AbstractString;
+    snr_index::Int=1,
+    instance_index::Int=1,
+    modulation=nothing,
+    free_dims::Int=4,
+    fixed_candidates_per_dim::Int=2,
+    max_branches::Int=256,
+    trials::Int=128,
+    num_cycles::Int=100,
+    cycles_scaler::Real=1.0,
+    noise_ratio::Real=1.0,
+    noise_stepper::Symbol=:linear,
+    optimizer::Symbol=:batch,
+    batch_rate::Real=0.5,
+    eoffset::Real=0.0,
+    cacheCouplings::Bool=true,
+    preprocess=:normal,
+    seed=nothing,
+    backend=:cpu,
+    gpuBatchSize::Int=256,
+    gpuFloat::Type{<:AbstractFloat}=Float32,
+    cpuThreads::Bool=true,
+)
+    backend_val = _check_mimo_backend(backend)
+    if Symbol(backend) !== :cpu
+        return _solve_mimo_potts_batched(path, backend_val;
+            snr_index = snr_index,
+            instance_index = instance_index,
+            modulation = modulation,
+            free_dims = free_dims,
+            fixed_candidates_per_dim = fixed_candidates_per_dim,
+            max_branches = max_branches,
+            trials = trials,
+            num_cycles = num_cycles,
+            cycles_scaler = cycles_scaler,
+            noise_ratio = noise_ratio,
+            noise_stepper = noise_stepper,
+            optimizer = optimizer,
+            batch_rate = batch_rate,
+            eoffset = eoffset,
+            cacheCouplings = cacheCouplings,
+            preprocess = preprocess,
+            seed = seed,
+            gpuBatchSize = gpuBatchSize,
+            gpuFloat = gpuFloat,
+        )
+    end
+
+    old_blas_threads = BLAS.get_num_threads()
+    if old_blas_threads != 1
+        BLAS.set_num_threads(1)
+    end
+    try
+
+    inst = load_mimo_potts_instance(path; snr_index, instance_index, modulation)
+    prep = zf_mmse_preprocess(inst)
+    geometry = _preprocessed_geometry(inst, preprocess)
+    initial_radius = Float64(prep.base_distance)
+
+    branches = build_mimo_potts_branches(inst, prep;
+        free_dims = free_dims,
+        fixed_candidates_per_dim = fixed_candidates_per_dim,
+        max_branches = max_branches,
+        H = geometry.H,
+        y = geometry.y,
+        const_offset = geometry.const_offset,
+    )
+    coupling_cache = isempty(branches) ? nothing : _make_coupling_cache(geometry.H, geometry.y, branches[1].free_indices, branches[1].fixed_indices, geometry.const_offset, cacheCouplings)
+
+    seed_rng = isnothing(seed) ? Random.default_rng() : nothing
+    trial_seeds = Vector{UInt64}(undef, trials)
+    for trial in 1:trials
+        trial_seeds[trial] = isnothing(seed) ? rand(seed_rng, UInt64) : _trial_seed(seed, snr_index, instance_index, 0, trial)
+    end
+
+    trial_results = Vector{Any}(undef, trials)
+    elapsed = @elapsed begin
+        if cpuThreads && nthreads() > 1 && trials > 1
+            @threads for trial in 1:trials
+                trial_results[trial] = _run_cpu_trial(inst, prep, geometry, branches, coupling_cache;
+                    trial_seed = trial_seeds[trial],
+                    optimizer = optimizer,
+                    num_cycles = num_cycles,
+                    cycles_scaler = cycles_scaler,
+                    noise_ratio = noise_ratio,
+                    noise_stepper = noise_stepper,
+                    batch_rate = batch_rate,
+                    eoffset = eoffset,
+                )
+            end
+        else
+            for trial in 1:trials
+                trial_results[trial] = _run_cpu_trial(inst, prep, geometry, branches, coupling_cache;
+                    trial_seed = trial_seeds[trial],
+                    optimizer = optimizer,
+                    num_cycles = num_cycles,
+                    cycles_scaler = cycles_scaler,
+                    noise_ratio = noise_ratio,
+                    noise_stepper = noise_stepper,
+                    batch_rate = batch_rate,
+                    eoffset = eoffset,
+                )
+            end
+        end
+    end
+
+    best_states = copy(prep.base_states)
+    best_values = copy(prep.base_values)
+    best_distance = initial_radius
+    step_found_best = 0
+    trial_found_best = 0
+    branch_found_best = 0
+    total_steps = 0
+    total_gradient_evals = 0
+    branches_visited = 0
+    branches_pruned = 0
+    radius_updates = 0
+    step_offset = 0
+
+    for trial in 1:trials
+        tr = trial_results[trial]
+        branches_visited += tr.branches_visited
+        branches_pruned += tr.branches_pruned
+        radius_updates += tr.radius_updates
+        total_steps += tr.total_steps
+        total_gradient_evals += tr.total_gradient_evals
+
+        if tr.best_distance < best_distance
+            best_states = tr.best_states
+            best_values = tr.best_values
+            best_distance = tr.best_distance
+            step_found_best = step_offset + tr.step_found_best
+            trial_found_best = trial
+            branch_found_best = tr.branch_found_best
+        end
+        step_offset += tr.total_steps
+    end
+
+    ber, ser, fer = detection_error_rates(best_states, inst.x_true, inst.levels)
+    result = MIMOPottsSolveResult(
+        source = inst.source,
+        snr_index = inst.snr_index,
+        instance_index = inst.instance_index,
+        ebnodb = inst.ebnodb,
+        modulation = inst.modulation,
+        optimizer = optimizer,
+        trials = trials,
+        num_cycles = num_cycles,
+        noise_ratio = Float64(noise_ratio),
+        cycles_scaler = Float64(cycles_scaler),
+        free_dims = free_dims,
+        initial_radius = Float64(prep.base_distance),
+        final_radius = best_distance,
+        best_distance = best_distance,
+        zf_distance = Float64(prep.zf_distance),
+        mmse_distance = Float64(prep.mmse_distance),
+        step_found_best = step_found_best,
+        trial_found_best = trial_found_best,
+        branch_found_best = branch_found_best,
+        total_steps = total_steps,
+        total_gradient_evals = total_gradient_evals,
+        branches_generated = length(branches),
+        branches_visited = branches_visited,
+        branches_pruned = branches_pruned,
+        radius_updates = radius_updates,
+        ber = ber,
+        ser = ser,
+        fer = fer,
+        zf_ber = Float64(prep.zf_ber),
+        mmse_ber = Float64(prep.mmse_ber),
+        best_states = best_states,
+        best_values = best_values,
+        step_time = elapsed,
+        preprocess = geometry.preprocess,
+        cache_couplings = cacheCouplings,
+    )
+    return result
+finally
+    if old_blas_threads != 1
+        BLAS.set_num_threads(old_blas_threads)
+    end
+end
+end
 function _drop_keys(row, keys_to_drop::Tuple)
     names = Tuple(k for k in keys(row) if !(k in keys_to_drop))
     return NamedTuple{names}(row)
@@ -812,6 +1338,10 @@ function curunanmimoinstance(instance_path::AbstractString;
     saveMetadata = nothing,
     showProgress::Bool = true,
     resultFormat = :flat,
+    backend = :cpu,
+    gpuBatchSize::Int = 256,
+    gpuFloat::Type{<:AbstractFloat} = Float32,
+    cpuThreads::Bool = true,
 )
     format = Symbol(resultFormat)
     if !(format in (:flat, :compact))
@@ -857,6 +1387,9 @@ function curunanmimoinstance(instance_path::AbstractString;
                 cacheCouplings = cacheCouplings,
                 preprocess = preprocess,
                 seed = run_seed,
+                backend = backend,
+                gpuBatchSize = gpuBatchSize,
+                gpuFloat = gpuFloat,
             )
 
             if format === :flat
