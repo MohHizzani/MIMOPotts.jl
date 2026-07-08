@@ -34,8 +34,58 @@ function _threads_for_free_dims(f::Int)
     return max(32, threads)
 end
 
+# G is the (symmetric) free-dimension Gram matrix, stored untransposed. Indexing
+# G[tid, j] inside a loop over j keeps consecutive threads' accesses stride-1
+# (coalesced) for a fixed j, unlike the previous Gt[j, tid] convention (stride-f,
+# one memory transaction per lane). Because G is symmetric, G[tid, j] == G[j, tid]
+# mathematically, so this is a pure memory-layout fix, not an algorithm change.
+@inline function _row_dot(G, values, tid, f::Int32, job)
+    row_sum = zero(eltype(values))
+    @inbounds for j in Int32(1):f
+        row_sum += G[tid, j] * values[j, job]
+    end
+    return row_sum
+end
+
+@inline function _propose(tid, f::Int32, k::Int32, G, values, h, states, seeds, job, step::Int32,
+    gdiag, levels, base_scale, use_dau::Bool, dau_offsets, directional_noise::Bool)
+    T = eltype(values)
+    vi = values[tid, job]
+    row_sum = _row_dot(G, values, tid, f, job)
+    grad = T(2) * row_sum + h[tid, job]
+    scale = use_dau ? base_scale + dau_offsets[job] : base_scale
+    noise = scale * (T(2) * _rand_unit(T, seeds[job], step, tid, Int32(23)) - T(1))
+    current = states[tid, job]
+    proposed = current
+    best_score = zero(T)
+    if current > Int32(1)
+        down = current - Int32(1)
+        delta = levels[down] - vi
+        true_delta = delta * grad + gdiag[tid] * delta * delta
+        score = directional_noise ? true_delta - delta * noise : true_delta + abs(delta) * noise
+        if score < best_score
+            best_score = score
+            proposed = down
+        end
+    end
+    if current < k
+        up = current + Int32(1)
+        delta = levels[up] - vi
+        true_delta = delta * grad + gdiag[tid] * delta * delta
+        score = directional_noise ? true_delta - delta * noise : true_delta + abs(delta) * noise
+        if score < best_score
+            proposed = up
+        end
+    end
+    return proposed
+end
+
+# =====================================================================
+# Block-reduction kernels (multi-warp blocks, f > 32). Same shared-memory
+# tree-reduction structure as before; only the G indexing changed.
+# =====================================================================
 function _potts_init_kernel!(states, values::AbstractArray{T}, best_states, best_distance, step_found,
-    seeds, Gt, h, levels, const_terms, f::Int32, k::Int32) where {T<:AbstractFloat}
+    seeds, G, h, levels, const_terms, f::Int32, k::Int32) where {T<:AbstractFloat}
     tid = Int32(threadIdx().x)
     job = Int32(blockIdx().x)
     nthreads = Int32(blockDim().x)
@@ -54,11 +104,7 @@ function _potts_init_kernel!(states, values::AbstractArray{T}, best_states, best
     e = zero(T)
     if tid <= f
         vi = values[tid, job]
-        row_sum = zero(T)
-        @inbounds for j in Int32(1):f
-            row_sum += Gt[j, tid] * values[j, job]
-        end
-        e = vi * row_sum + h[tid, job] * vi
+        e = vi * _row_dot(G, values, tid, f, job) + h[tid, job] * vi
     end
     shmem[tid] = e
     sync_threads()
@@ -80,7 +126,7 @@ function _potts_init_kernel!(states, values::AbstractArray{T}, best_states, best
 end
 
 function _potts_step_kernel!(states, values::AbstractArray{T}, best_states, best_distance, step_found, dau_offsets,
-    seeds, Gt, gdiag, h, levels, const_terms, f::Int32, k::Int32, step::Int32,
+    seeds, G, gdiag, h, levels, const_terms, f::Int32, k::Int32, step::Int32,
     base_scale::T, batch_rate::T, eoffset::T, use_dau::Bool, single_flip::Bool, directional_noise::Bool) where {T<:AbstractFloat}
     tid = Int32(threadIdx().x)
     job = Int32(blockIdx().x)
@@ -91,39 +137,8 @@ function _potts_step_kernel!(states, values::AbstractArray{T}, best_states, best
     proposed = Int32(0)
     changed = false
     if tid <= f
-        vi = values[tid, job]
-        row_sum = zero(T)
-        @inbounds for j in Int32(1):f
-            row_sum += Gt[j, tid] * values[j, job]
-        end
-        grad = T(2) * row_sum + h[tid, job]
-        scale = use_dau ? base_scale + dau_offsets[job] : base_scale
-        noise = scale * (T(2) * _rand_unit(T, seeds[job], step, tid, Int32(23)) - T(1))
-        current = states[tid, job]
-        proposed = current
-        best_score = zero(T)
-
-        if current > Int32(1)
-            down = current - Int32(1)
-            delta = levels[down] - vi
-            true_delta = delta * grad + gdiag[tid] * delta * delta
-            score = directional_noise ? true_delta - delta * noise : true_delta + abs(delta) * noise
-            if score < best_score
-                best_score = score
-                proposed = down
-            end
-        end
-        if current < k
-            up = current + Int32(1)
-            delta = levels[up] - vi
-            true_delta = delta * grad + gdiag[tid] * delta * delta
-            score = directional_noise ? true_delta - delta * noise : true_delta + abs(delta) * noise
-            if score < best_score
-                best_score = score
-                proposed = up
-            end
-        end
-        changed = proposed != current
+        proposed = _propose(tid, f, k, G, values, h, states, seeds, job, step, gdiag, levels, base_scale, use_dau, dau_offsets, directional_noise)
+        changed = proposed != states[tid, job]
     end
 
     if single_flip
@@ -180,11 +195,7 @@ function _potts_step_kernel!(states, values::AbstractArray{T}, best_states, best
     e = zero(T)
     if tid <= f
         vi = values[tid, job]
-        row_sum = zero(T)
-        @inbounds for j in Int32(1):f
-            row_sum += Gt[j, tid] * values[j, job]
-        end
-        e = vi * row_sum + h[tid, job] * vi
+        e = vi * _row_dot(G, values, tid, f, job) + h[tid, job] * vi
     end
     shmem[tid] = e
     sync_threads()
@@ -217,6 +228,124 @@ function _potts_step_kernel!(states, values::AbstractArray{T}, best_states, best
     return nothing
 end
 
+# =====================================================================
+# Warp-shuffle kernels: valid whenever a block is exactly one warp (f <= 32,
+# which _threads_for_free_dims always rounds up to 32 threads). This covers
+# every size class in the currently selected production hyperparameters
+# (results/mimo/hyperparams.tsv: freeDims = 4, 8, 32). No shared memory and
+# no sync_threads() at all -- shfl_*_sync provides the needed synchronization
+# within a warp, replacing the block-wide tree reductions above.
+# =====================================================================
+@inline function _warp_sum(mask::UInt32, val::T) where {T<:AbstractFloat}
+    offset = Int32(16)
+    while offset > 0
+        val += CUDA.shfl_down_sync(mask, val, offset)
+        offset >>>= Int32(1)
+    end
+    return val
+end
+
+function _potts_init_kernel_warp!(states, values::AbstractArray{T}, best_states, best_distance, step_found,
+    seeds, G, h, levels, const_terms, f::Int32, k::Int32) where {T<:AbstractFloat}
+    tid = Int32(threadIdx().x)
+    job = Int32(blockIdx().x)
+    mask = 0xffffffff
+
+    if tid <= f
+        seed = seeds[job]
+        state = Int32(1) + Int32(floor(_rand_unit(T, seed, Int32(0), tid, Int32(11)) * T(k)))
+        state = ifelse(state < Int32(1), Int32(1), ifelse(state > k, k, state))
+        states[tid, job] = state
+        best_states[tid, job] = state
+        values[tid, job] = levels[state]
+    end
+    sync_warp()
+
+    e = zero(T)
+    if tid <= f
+        vi = values[tid, job]
+        e = vi * _row_dot(G, values, tid, f, job) + h[tid, job] * vi
+    end
+    esum = _warp_sum(mask, e)
+
+    if tid == Int32(1)
+        best_distance[job] = esum + const_terms[job]
+        step_found[job] = Int32(0)
+    end
+    return nothing
+end
+
+function _potts_step_kernel_warp!(states, values::AbstractArray{T}, best_states, best_distance, step_found, dau_offsets,
+    seeds, G, gdiag, h, levels, const_terms, f::Int32, k::Int32, step::Int32,
+    base_scale::T, batch_rate::T, eoffset::T, use_dau::Bool, single_flip::Bool, directional_noise::Bool) where {T<:AbstractFloat}
+    tid = Int32(threadIdx().x)
+    job = Int32(blockIdx().x)
+    mask = 0xffffffff
+
+    proposed = Int32(0)
+    changed = false
+    if tid <= f
+        proposed = _propose(tid, f, k, G, values, h, states, seeds, job, step, gdiag, levels, base_scale, use_dau, dau_offsets, directional_noise)
+        changed = proposed != states[tid, job]
+    end
+
+    applied = zero(T)
+    if single_flip
+        priority = changed ? _rand_unit(T, seeds[job], step, tid, Int32(37)) : -one(T)
+        idx = T(tid)
+        offset = Int32(16)
+        while offset > 0
+            other_p = CUDA.shfl_down_sync(mask, priority, offset)
+            other_i = CUDA.shfl_down_sync(mask, idx, offset)
+            if other_p > priority || (other_p == priority && other_i < idx)
+                priority = other_p
+                idx = other_i
+            end
+            offset >>>= Int32(1)
+        end
+        winner = CUDA.shfl_sync(mask, idx, Int32(1))
+        winner_priority = CUDA.shfl_sync(mask, priority, Int32(1))
+        selected = changed && tid == Int32(round(winner)) && winner_priority >= zero(T)
+        if selected
+            states[tid, job] = proposed
+            values[tid, job] = levels[proposed]
+            applied = one(T)
+        end
+    elseif changed && (_rand_unit(T, seeds[job], step, tid, Int32(37)) < batch_rate)
+        states[tid, job] = proposed
+        values[tid, job] = levels[proposed]
+        applied = one(T)
+    end
+
+    if use_dau
+        applied_sum = _warp_sum(mask, applied)
+        if tid == Int32(1)
+            dau_offsets[job] = applied_sum > zero(T) ? zero(T) : dau_offsets[job] + eoffset
+        end
+    end
+    sync_warp()
+
+    e = zero(T)
+    if tid <= f
+        vi = values[tid, job]
+        e = vi * _row_dot(G, values, tid, f, job) + h[tid, job] * vi
+    end
+    esum = _warp_sum(mask, e)
+
+    if tid == Int32(1)
+        distance = esum + const_terms[job]
+        if distance < best_distance[job]
+            best_distance[job] = distance
+            step_found[job] = step
+        end
+    end
+
+    if tid <= f
+        best_states[tid, job] = states[tid, job]
+    end
+    return nothing
+end
+
 function _run_cuda_jobs(G_host, h_host, const_terms_host, levels, seeds::AbstractVector{UInt64};
     optimizer::Symbol,
     num_cycles::Int,
@@ -238,7 +367,8 @@ function _run_cuda_jobs(G_host, h_host, const_terms_host, levels, seeds::Abstrac
     end
 
     threads = _threads_for_free_dims(f)
-    shmem = (2 * threads + 1) * sizeof(T)
+    use_warp = threads <= 32
+    shmem = use_warp ? 0 : (2 * threads + 1) * sizeof(T)
     noise_start = T(Float64(noise_ratio) * MIMOPotts._gradient_bound(G_host, vec(h_host[:, 1]), levels))
 
     states = CUDA.zeros(Int32, f, jobs)
@@ -248,26 +378,35 @@ function _run_cuda_jobs(G_host, h_host, const_terms_host, levels, seeds::Abstrac
     step_found = CUDA.zeros(Int32, jobs)
     dau_offsets = CUDA.zeros(T, jobs)
     seeds_d = CuArray(UInt64.(seeds))
-    Gt = CuArray(T.(transpose(G_host)))
+    G_d = CuArray(T.(G_host))
     gdiag_d = CuArray(T.(diag(G_host)))
     h_d = CuArray(T.(h_host))
     levels_d = CuArray(T.(levels))
     const_terms_d = CuArray(T.(const_terms_host))
 
-    CUDA.@sync @cuda threads=threads blocks=jobs shmem=shmem _potts_init_kernel!(
+    init_kernel! = use_warp ? _potts_init_kernel_warp! : _potts_init_kernel!
+    step_kernel! = use_warp ? _potts_step_kernel_warp! : _potts_step_kernel!
+
+    @cuda threads=threads blocks=jobs shmem=shmem init_kernel!(
         states, values, best_states, best_distance, step_found,
-        seeds_d, Gt, h_d, levels_d, const_terms_d, Int32(f), Int32(k))
+        seeds_d, G_d, h_d, levels_d, const_terms_d, Int32(f), Int32(k))
 
     use_dau = optimizer === :batchdau || optimizer === :dau
     single_flip = optimizer === :singleflip || optimizer === :dau
     directional_noise = noise_coupling === :directional
+    # Kernels are launched on the default stream without a per-step host sync:
+    # CUDA preserves same-stream launch order, so each step's kernel only ever
+    # observes the previous step's completed writes. A per-step CUDA.@sync was
+    # measured to roughly double this loop's wall time for no correctness
+    # benefit (no host-side readback happens until after the loop).
     for step in 1:steps
         base_scale = T(MIMOPotts._noise_scale(noise_stepper, noise_start, steps, step))
-        CUDA.@sync @cuda threads=threads blocks=jobs shmem=shmem _potts_step_kernel!(
+        @cuda threads=threads blocks=jobs shmem=shmem step_kernel!(
             states, values, best_states, best_distance, step_found, dau_offsets,
-            seeds_d, Gt, gdiag_d, h_d, levels_d, const_terms_d, Int32(f), Int32(k), Int32(step),
+            seeds_d, G_d, gdiag_d, h_d, levels_d, const_terms_d, Int32(f), Int32(k), Int32(step),
             base_scale, T(batch_rate), T(eoffset), use_dau, single_flip, directional_noise)
     end
+    CUDA.synchronize()
 
     best_distance_h = Array(best_distance)
     best_states_h = Array(best_states)

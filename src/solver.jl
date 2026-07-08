@@ -920,6 +920,7 @@ function _solve_mimo_potts_batched(path::AbstractString, backend_val;
     seed,
     gpuBatchSize::Int,
     gpuFloat::Type{<:AbstractFloat},
+    return_all_trials::Bool=false,
 )
     if !(optimizer in (:batch, :batchdau, :singleflip, :dau))
         error("Unsupported MIMO Potts optimizer $(optimizer). Use :batch, :singleflip, :dau, or :batchdau.")
@@ -955,6 +956,13 @@ function _solve_mimo_potts_batched(path::AbstractString, backend_val;
     trial_best_distance = fill(initial_radius, trials)
     trial_best_states = [copy(prep.base_states) for _ in 1:trials]
     trial_best_values = [copy(prep.base_values) for _ in 1:trials]
+    trial_step_found_best = zeros(Int, trials)
+    trial_branch_found_best = zeros(Int, trials)
+    trial_total_steps = zeros(Int, trials)
+    trial_total_gradient_evals = zeros(Int, trials)
+    trial_branches_visited = zeros(Int, trials)
+    trial_branches_pruned = zeros(Int, trials)
+    trial_radius_updates = zeros(Int, trials)
 
     elapsed = @elapsed begin
         branch_i = 1
@@ -966,6 +974,14 @@ function _solve_mimo_potts_batched(path::AbstractString, backend_val;
             while branch_i <= length(branches) && (isempty(chunk_branches) || chunk_jobs < max(1, gpuBatchSize))
                 branch = branches[branch_i]
                 active_trials = [trial for trial in 1:trials if branch.lower_bound < current_radius[trial]]
+                active_set = Set(active_trials)
+                for trial in 1:trials
+                    if trial in active_set
+                        trial_branches_visited[trial] += 1
+                    else
+                        trial_branches_pruned[trial] += 1
+                    end
+                end
                 branches_pruned += trials - length(active_trials)
                 if !isempty(active_trials)
                     branches_visited += length(active_trials)
@@ -981,6 +997,8 @@ function _solve_mimo_potts_batched(path::AbstractString, backend_val;
             end
 
             batch_step_offset = total_steps
+            trial_batch_step_offset = copy(trial_total_steps)
+            trial_chunk_job_index = zeros(Int, trials)
             subs_by_branch = _run_potts_subproblem_branch_batch_backend(backend_val, inst, chunk_branches, chunk_active_trials, prep;
                 H = geometry.H,
                 y = geometry.y,
@@ -1008,8 +1026,11 @@ function _solve_mimo_potts_batched(path::AbstractString, backend_val;
                 for (local_i, sub) in enumerate(subs)
                     job_linear += 1
                     trial = active_trials[local_i]
+                    trial_chunk_job_index[trial] += 1
                     total_steps += sub.total_steps
                     total_gradient_evals += sub.total_gradient_evals
+                    trial_total_steps[trial] += sub.total_steps
+                    trial_total_gradient_evals[trial] += sub.total_gradient_evals
 
                     if sub.best_distance < trial_best_distance[trial]
                         candidate_states = _full_states(prep, branch, sub.best_free_states)
@@ -1021,6 +1042,9 @@ function _solve_mimo_potts_batched(path::AbstractString, backend_val;
                             trial_best_distance[trial] = candidate_distance
                             current_radius[trial] = candidate_distance
                             radius_updates += 1
+                            trial_radius_updates[trial] += 1
+                            trial_step_found_best[trial] = trial_batch_step_offset[trial] + (trial_chunk_job_index[trial] - 1) * sub.total_steps + sub.step_found
+                            trial_branch_found_best[trial] = branch.rank
 
                             if candidate_distance < best_distance
                                 best_states = candidate_states
@@ -1044,6 +1068,53 @@ function _solve_mimo_potts_batched(path::AbstractString, backend_val;
                 trial_found_best = trial
             end
         end
+    end
+
+    if return_all_trials
+        per_trial_step_time = elapsed / trials
+        return [
+            let (tber, tser, tfer) = detection_error_rates(trial_best_states[trial], inst.x_true, inst.levels)
+                MIMOPottsSolveResult(
+                    source = inst.source,
+                    snr_index = inst.snr_index,
+                    instance_index = inst.instance_index,
+                    ebnodb = inst.ebnodb,
+                    modulation = inst.modulation,
+                    optimizer = optimizer,
+                    trials = 1,
+                    num_cycles = num_cycles,
+                    noise_ratio = Float64(noise_ratio),
+                    noise_coupling = noise_coupling,
+                    cycles_scaler = Float64(cycles_scaler),
+                    free_dims = free_dims,
+                    initial_radius = Float64(prep.base_distance),
+                    final_radius = trial_best_distance[trial],
+                    best_distance = trial_best_distance[trial],
+                    zf_distance = Float64(prep.zf_distance),
+                    mmse_distance = Float64(prep.mmse_distance),
+                    step_found_best = trial_step_found_best[trial],
+                    trial_found_best = 1,
+                    branch_found_best = trial_branch_found_best[trial],
+                    total_steps = trial_total_steps[trial],
+                    total_gradient_evals = trial_total_gradient_evals[trial],
+                    branches_generated = length(branches),
+                    branches_visited = trial_branches_visited[trial],
+                    branches_pruned = trial_branches_pruned[trial],
+                    radius_updates = trial_radius_updates[trial],
+                    ber = tber,
+                    ser = tser,
+                    fer = tfer,
+                    zf_ber = Float64(prep.zf_ber),
+                    mmse_ber = Float64(prep.mmse_ber),
+                    best_states = trial_best_states[trial],
+                    best_values = trial_best_values[trial],
+                    step_time = per_trial_step_time,
+                    preprocess = geometry.preprocess,
+                    cache_couplings = cacheCouplings,
+                )
+            end
+            for trial in 1:trials
+        ]
     end
 
     ber, ser, fer = detection_error_rates(best_states, inst.x_true, inst.levels)
@@ -1569,23 +1640,73 @@ function curunanmimoinstance(instance_path::AbstractString;
     run_id = 0
     run_counter = 0
 
+    run_on_cpu = Symbol(backend) === :cpu
+
     for snr_index in snrs, instance_index in instances, noise_ratio in noise_ratios, cycles_scaler in cycles_scalers, free_dims in free_dims_values
         run_id += 1
         shared_row_added = false
-        for outer_trial in 1:trials
-            run_counter += 1
-            if showProgress
-                println("MIMO Potts run $(run_counter): runId=$(run_id), snr=$(snr_index), instance=$(instance_index), outerTrial=$(outer_trial), noiseRatio=$(noise_ratio), noiseCoupling=$(noise_coupling), cyclesScaler=$(cycles_scaler), freeDims=$(free_dims), optimizer=$(optimizer)")
+
+        if run_on_cpu
+            for outer_trial in 1:trials
+                run_counter += 1
+                if showProgress
+                    println("MIMO Potts run $(run_counter): runId=$(run_id), snr=$(snr_index), instance=$(instance_index), outerTrial=$(outer_trial), noiseRatio=$(noise_ratio), noiseCoupling=$(noise_coupling), cyclesScaler=$(cycles_scaler), freeDims=$(free_dims), optimizer=$(optimizer)")
+                end
+                run_seed = isnothing(seed) ? nothing : hash((seed, snr_index, instance_index, noise_ratio, cycles_scaler, free_dims, outer_trial))
+                r = solve_mimo_potts(instance_path;
+                    snr_index = Int(snr_index),
+                    instance_index = Int(instance_index),
+                    modulation = modulation,
+                    free_dims = Int(free_dims),
+                    fixed_candidates_per_dim = fixed_candidates_per_dim,
+                    max_branches = max_branches,
+                    trials = 1,
+                    num_cycles = numCycles,
+                    cycles_scaler = cycles_scaler,
+                    noise_ratio = noise_ratio,
+                    noise_stepper = noise_stepper,
+                    noise_coupling = noise_coupling,
+                    optimizer = optimizer,
+                    batch_rate = batch_rate,
+                    eoffset = eoffset,
+                    cacheCouplings = cacheCouplings,
+                    preprocess = preprocess,
+                    seed = run_seed,
+                    backend = backend,
+                    gpuBatchSize = gpuBatchSize,
+                    gpuFloat = gpuFloat,
+                )
+
+                if format === :flat
+                    push!(rows, merge(_result_row(r), (outerTrial = outer_trial,)))
+                else
+                    if !shared_row_added
+                        push!(run_rows, _shared_result_row(r, run_id))
+                        shared_row_added = true
+                    end
+                    push!(trial_rows, _trial_result_row(r, run_id, outer_trial))
+                end
             end
-            run_seed = isnothing(seed) ? nothing : hash((seed, snr_index, instance_index, noise_ratio, cycles_scaler, free_dims, outer_trial))
-            r = solve_mimo_potts(instance_path;
+        else
+            # Non-CPU backends (e.g. :cuda) batch all `trials` outer trials into a
+            # single call instead of looping `trials` times with trials=1: looping
+            # re-does load_mimo_potts_instance/branch-building/GPU buffer
+            # allocation+H2D transfer from scratch for every trial even though only
+            # the RNG seed differs, which measured ~7.5-7.8x slower than batching.
+            run_counter += trials
+            if showProgress
+                println("MIMO Potts run $(run_counter - trials + 1)-$(run_counter): runId=$(run_id), snr=$(snr_index), instance=$(instance_index), trials=$(trials) (batched), noiseRatio=$(noise_ratio), noiseCoupling=$(noise_coupling), cyclesScaler=$(cycles_scaler), freeDims=$(free_dims), optimizer=$(optimizer)")
+            end
+            run_seed = isnothing(seed) ? nothing : hash((seed, snr_index, instance_index, noise_ratio, cycles_scaler, free_dims))
+            backend_val = _check_mimo_backend(backend)
+            results = _solve_mimo_potts_batched(instance_path, backend_val;
                 snr_index = Int(snr_index),
                 instance_index = Int(instance_index),
                 modulation = modulation,
                 free_dims = Int(free_dims),
                 fixed_candidates_per_dim = fixed_candidates_per_dim,
                 max_branches = max_branches,
-                trials = 1,
+                trials = trials,
                 num_cycles = numCycles,
                 cycles_scaler = cycles_scaler,
                 noise_ratio = noise_ratio,
@@ -1597,19 +1718,21 @@ function curunanmimoinstance(instance_path::AbstractString;
                 cacheCouplings = cacheCouplings,
                 preprocess = preprocess,
                 seed = run_seed,
-                backend = backend,
                 gpuBatchSize = gpuBatchSize,
                 gpuFloat = gpuFloat,
+                return_all_trials = true,
             )
 
-            if format === :flat
-                push!(rows, merge(_result_row(r), (outerTrial = outer_trial,)))
-            else
-                if !shared_row_added
-                    push!(run_rows, _shared_result_row(r, run_id))
-                    shared_row_added = true
+            for (outer_trial, r) in enumerate(results)
+                if format === :flat
+                    push!(rows, merge(_result_row(r), (outerTrial = outer_trial,)))
+                else
+                    if !shared_row_added
+                        push!(run_rows, _shared_result_row(r, run_id))
+                        shared_row_added = true
+                    end
+                    push!(trial_rows, _trial_result_row(r, run_id, outer_trial))
                 end
-                push!(trial_rows, _trial_result_row(r, run_id, outer_trial))
             end
         end
     end
