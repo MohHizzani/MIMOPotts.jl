@@ -1,6 +1,7 @@
 module MIMOPottsCUDAExt
 
 using CUDA
+using LinearAlgebra: diag
 
 import MIMOPotts
 import MIMOPotts: MIMOPottsInstance, MIMOPottsBranch
@@ -79,14 +80,16 @@ function _potts_init_kernel!(states, values::AbstractArray{T}, best_states, best
 end
 
 function _potts_step_kernel!(states, values::AbstractArray{T}, best_states, best_distance, step_found, dau_offsets,
-    seeds, Gt, h, levels, const_terms, f::Int32, k::Int32, step::Int32,
-    base_scale::T, batch_rate::T, eoffset::T, use_dau::Bool) where {T<:AbstractFloat}
+    seeds, Gt, gdiag, h, levels, const_terms, f::Int32, k::Int32, step::Int32,
+    base_scale::T, batch_rate::T, eoffset::T, use_dau::Bool, single_flip::Bool, directional_noise::Bool) where {T<:AbstractFloat}
     tid = Int32(threadIdx().x)
     job = Int32(blockIdx().x)
     nthreads = Int32(blockDim().x)
-    shmem = CuDynamicSharedArray(T, Int(nthreads) + 1)
+    shmem = CuDynamicSharedArray(T, 2 * Int(nthreads) + 1)
 
     applied = zero(T)
+    proposed = Int32(0)
+    changed = false
     if tid <= f
         vi = values[tid, job]
         row_sum = zero(T)
@@ -96,17 +99,67 @@ function _potts_step_kernel!(states, values::AbstractArray{T}, best_states, best
         grad = T(2) * row_sum + h[tid, job]
         scale = use_dau ? base_scale + dau_offsets[job] : base_scale
         noise = scale * (T(2) * _rand_unit(T, seeds[job], step, tid, Int32(23)) - T(1))
-        dir = grad < noise ? Int32(1) : Int32(-1)
-        proposed = states[tid, job] + dir
-        proposed = ifelse(proposed < Int32(1), Int32(1), ifelse(proposed > k, k, proposed))
-        changed = proposed != states[tid, job]
-        do_apply = changed && (_rand_unit(T, seeds[job], step, tid, Int32(37)) < batch_rate)
-        if do_apply
+        current = states[tid, job]
+        proposed = current
+        best_score = zero(T)
+
+        if current > Int32(1)
+            down = current - Int32(1)
+            delta = levels[down] - vi
+            true_delta = delta * grad + gdiag[tid] * delta * delta
+            score = directional_noise ? true_delta - delta * noise : true_delta + abs(delta) * noise
+            if score < best_score
+                best_score = score
+                proposed = down
+            end
+        end
+        if current < k
+            up = current + Int32(1)
+            delta = levels[up] - vi
+            true_delta = delta * grad + gdiag[tid] * delta * delta
+            score = directional_noise ? true_delta - delta * noise : true_delta + abs(delta) * noise
+            if score < best_score
+                best_score = score
+                proposed = up
+            end
+        end
+        changed = proposed != current
+    end
+
+    if single_flip
+        priority = changed ? _rand_unit(T, seeds[job], step, tid, Int32(37)) : -one(T)
+        shmem[tid] = priority
+        shmem[Int(nthreads) + Int(tid)] = T(tid)
+        sync_threads()
+
+        offset = nthreads >>> 1
+        while offset > 0
+            if tid <= offset
+                left_priority = shmem[tid]
+                right_priority = shmem[tid + offset]
+                left_index = shmem[Int(nthreads) + Int(tid)]
+                right_index = shmem[Int(nthreads) + Int(tid + offset)]
+                if right_priority > left_priority || (right_priority == left_priority && right_index < left_index)
+                    shmem[tid] = right_priority
+                    shmem[Int(nthreads) + Int(tid)] = right_index
+                end
+            end
+            sync_threads()
+            offset >>>= 1
+        end
+
+        selected = changed && tid == Int32(round(shmem[Int(nthreads) + 1])) && shmem[1] >= zero(T)
+        if selected
             states[tid, job] = proposed
             values[tid, job] = levels[proposed]
             applied = one(T)
         end
+    elseif changed && (_rand_unit(T, seeds[job], step, tid, Int32(37)) < batch_rate)
+        states[tid, job] = proposed
+        values[tid, job] = levels[proposed]
+        applied = one(T)
     end
+
     shmem[tid] = applied
     sync_threads()
 
@@ -151,14 +204,14 @@ function _potts_step_kernel!(states, values::AbstractArray{T}, best_states, best
         if improved
             best_distance[job] = distance
             step_found[job] = step
-            shmem[Int(nthreads) + 1] = one(T)
+            shmem[2 * Int(nthreads) + 1] = one(T)
         else
-            shmem[Int(nthreads) + 1] = zero(T)
+            shmem[2 * Int(nthreads) + 1] = zero(T)
         end
     end
     sync_threads()
 
-    if tid <= f && shmem[Int(nthreads) + 1] != zero(T)
+    if tid <= f && shmem[2 * Int(nthreads) + 1] != zero(T)
         best_states[tid, job] = states[tid, job]
     end
     return nothing
@@ -170,6 +223,7 @@ function _run_cuda_jobs(G_host, h_host, const_terms_host, levels, seeds::Abstrac
     cycles_scaler::Real,
     noise_ratio::Real,
     noise_stepper::Symbol,
+    noise_coupling::Symbol,
     batch_rate::Real,
     eoffset::Real,
     gpuFloat::Type{T},
@@ -184,7 +238,7 @@ function _run_cuda_jobs(G_host, h_host, const_terms_host, levels, seeds::Abstrac
     end
 
     threads = _threads_for_free_dims(f)
-    shmem = (threads + 1) * sizeof(T)
+    shmem = (2 * threads + 1) * sizeof(T)
     noise_start = T(Float64(noise_ratio) * MIMOPotts._gradient_bound(G_host, vec(h_host[:, 1]), levels))
 
     states = CUDA.zeros(Int32, f, jobs)
@@ -195,6 +249,7 @@ function _run_cuda_jobs(G_host, h_host, const_terms_host, levels, seeds::Abstrac
     dau_offsets = CUDA.zeros(T, jobs)
     seeds_d = CuArray(UInt64.(seeds))
     Gt = CuArray(T.(transpose(G_host)))
+    gdiag_d = CuArray(T.(diag(G_host)))
     h_d = CuArray(T.(h_host))
     levels_d = CuArray(T.(levels))
     const_terms_d = CuArray(T.(const_terms_host))
@@ -203,13 +258,15 @@ function _run_cuda_jobs(G_host, h_host, const_terms_host, levels, seeds::Abstrac
         states, values, best_states, best_distance, step_found,
         seeds_d, Gt, h_d, levels_d, const_terms_d, Int32(f), Int32(k))
 
-    use_dau = optimizer === :batchdau
+    use_dau = optimizer === :batchdau || optimizer === :dau
+    single_flip = optimizer === :singleflip || optimizer === :dau
+    directional_noise = noise_coupling === :directional
     for step in 1:steps
         base_scale = T(MIMOPotts._noise_scale(noise_stepper, noise_start, steps, step))
         CUDA.@sync @cuda threads=threads blocks=jobs shmem=shmem _potts_step_kernel!(
             states, values, best_states, best_distance, step_found, dau_offsets,
-            seeds_d, Gt, h_d, levels_d, const_terms_d, Int32(f), Int32(k), Int32(step),
-            base_scale, T(batch_rate), T(eoffset), use_dau)
+            seeds_d, Gt, gdiag_d, h_d, levels_d, const_terms_d, Int32(f), Int32(k), Int32(step),
+            base_scale, T(batch_rate), T(eoffset), use_dau, single_flip, directional_noise)
     end
 
     best_distance_h = Array(best_distance)
@@ -238,6 +295,7 @@ function _run_cuda_chunk(inst::MIMOPottsInstance, branch::MIMOPottsBranch, prep;
     cycles_scaler::Real,
     noise_ratio::Real,
     noise_stepper::Symbol,
+    noise_coupling::Symbol,
     batch_rate::Real,
     eoffset::Real,
     seeds::AbstractVector{UInt64},
@@ -255,6 +313,7 @@ function _run_cuda_chunk(inst::MIMOPottsInstance, branch::MIMOPottsBranch, prep;
             cycles_scaler = cycles_scaler,
             noise_ratio = noise_ratio,
             noise_stepper = noise_stepper,
+            noise_coupling = noise_coupling,
             batch_rate = batch_rate,
             eoffset = eoffset,
             seeds = seeds,
@@ -271,6 +330,7 @@ function _run_cuda_chunk(inst::MIMOPottsInstance, branch::MIMOPottsBranch, prep;
         cycles_scaler = cycles_scaler,
         noise_ratio = noise_ratio,
         noise_stepper = noise_stepper,
+        noise_coupling = noise_coupling,
         batch_rate = batch_rate,
         eoffset = eoffset,
         gpuFloat = gpuFloat,
@@ -287,14 +347,15 @@ function MIMOPotts._run_potts_subproblem_batch_backend(::Val{:cuda}, inst::MIMOP
     cycles_scaler::Real,
     noise_ratio::Real,
     noise_stepper::Symbol,
+    noise_coupling::Symbol,
     batch_rate::Real,
     eoffset::Real,
     seeds::AbstractVector{UInt64},
     gpuBatchSize::Int=256,
     gpuFloat::Type{<:AbstractFloat}=Float32,
 )
-    if !(optimizer in (:batch, :batchdau))
-        error("backend=:cuda currently supports optimizer=:batch and optimizer=:batchdau. Use backend=:cpu for $(optimizer).")
+    if !(optimizer in (:batch, :batchdau, :singleflip, :dau))
+        error("Unsupported MIMO Potts optimizer $(optimizer). Use :batch, :singleflip, :dau, or :batchdau.")
     end
     if !CUDA.functional()
         error("CUDA.jl is loaded, but no functional CUDA GPU is available.")
@@ -314,6 +375,7 @@ function MIMOPotts._run_potts_subproblem_batch_backend(::Val{:cuda}, inst::MIMOP
             cycles_scaler = cycles_scaler,
             noise_ratio = noise_ratio,
             noise_stepper = noise_stepper,
+            noise_coupling = noise_coupling,
             batch_rate = batch_rate,
             eoffset = eoffset,
             seeds = seeds[first:last],
@@ -334,6 +396,7 @@ function _fallback_branch_batch(backend_val, inst, branches, active_trials_by_br
     cycles_scaler,
     noise_ratio,
     noise_stepper,
+    noise_coupling,
     batch_rate,
     eoffset,
     snr_index,
@@ -356,6 +419,7 @@ function _fallback_branch_batch(backend_val, inst, branches, active_trials_by_br
             cycles_scaler = cycles_scaler,
             noise_ratio = noise_ratio,
             noise_stepper = noise_stepper,
+            noise_coupling = noise_coupling,
             batch_rate = batch_rate,
             eoffset = eoffset,
             seeds = seeds,
@@ -376,6 +440,7 @@ function MIMOPotts._run_potts_subproblem_branch_batch_backend(::Val{:cuda}, inst
     cycles_scaler::Real,
     noise_ratio::Real,
     noise_stepper::Symbol,
+    noise_coupling::Symbol,
     batch_rate::Real,
     eoffset::Real,
     snr_index::Int,
@@ -384,8 +449,8 @@ function MIMOPotts._run_potts_subproblem_branch_batch_backend(::Val{:cuda}, inst
     gpuBatchSize::Int=256,
     gpuFloat::Type{T}=Float32,
 ) where {T<:AbstractFloat}
-    if !(optimizer in (:batch, :batchdau))
-        error("backend=:cuda currently supports optimizer=:batch and optimizer=:batchdau. Use backend=:cpu for $(optimizer).")
+    if !(optimizer in (:batch, :batchdau, :singleflip, :dau))
+        error("Unsupported MIMO Potts optimizer $(optimizer). Use :batch, :singleflip, :dau, or :batchdau.")
     end
     if isempty(branches)
         return Any[]
@@ -407,6 +472,7 @@ function MIMOPotts._run_potts_subproblem_branch_batch_backend(::Val{:cuda}, inst
             cycles_scaler = cycles_scaler,
             noise_ratio = noise_ratio,
             noise_stepper = noise_stepper,
+            noise_coupling = noise_coupling,
             batch_rate = batch_rate,
             eoffset = eoffset,
             snr_index = snr_index,
@@ -429,6 +495,7 @@ function MIMOPotts._run_potts_subproblem_branch_batch_backend(::Val{:cuda}, inst
             cycles_scaler = cycles_scaler,
             noise_ratio = noise_ratio,
             noise_stepper = noise_stepper,
+            noise_coupling = noise_coupling,
             batch_rate = batch_rate,
             eoffset = eoffset,
             snr_index = snr_index,
@@ -472,6 +539,7 @@ function MIMOPotts._run_potts_subproblem_branch_batch_backend(::Val{:cuda}, inst
             cycles_scaler = cycles_scaler,
             noise_ratio = noise_ratio,
             noise_stepper = noise_stepper,
+            noise_coupling = noise_coupling,
             batch_rate = batch_rate,
             eoffset = eoffset,
             gpuFloat = gpuFloat,

@@ -2,6 +2,7 @@
 export MIMOPottsInstance, MIMOPottsBranch, MIMOPottsSolveResult
 export pam_levels, load_mimo_potts_instance, solve_mimo_potts, curunanmimoinstance
 export save_mimo_potts_results, load_mimo_potts_results
+export trace_mimo_potts
 
 using LinearAlgebra
 using Random
@@ -55,6 +56,7 @@ Base.@kwdef struct MIMOPottsSolveResult
     trials::Int
     num_cycles::Int
     noise_ratio::Float64
+    noise_coupling::Symbol
     cycles_scaler::Float64
     free_dims::Int
     initial_radius::Float64
@@ -366,6 +368,39 @@ function _gradient_bound(G::AbstractMatrix, h::AbstractVector, levels::AbstractV
     return bound
 end
 
+function _check_noise_coupling(noise_coupling)
+    coupling = Symbol(noise_coupling)
+    coupling in (:directional, :common) ||
+        error("Unsupported noise_coupling $(noise_coupling). Use :directional or :common.")
+    return coupling
+end
+
+@inline function _best_adjacent_transition(grad_i::Real, gii::Real, state::Int,
+    value::Real, levels::AbstractVector, noise::Real, noise_coupling::Symbol)
+    best_state = state
+    best_delta = 0.0
+    best_true_delta = 0.0
+    best_score = 0.0
+
+    # Down is evaluated first, matching the old equality convention.
+    @inbounds for proposed in (state - 1, state + 1)
+        if 1 <= proposed <= length(levels)
+            delta = Float64(levels[proposed]) - Float64(value)
+            true_delta = delta * Float64(grad_i) + Float64(gii) * delta * delta
+            score = noise_coupling === :directional ?
+                true_delta - delta * Float64(noise) :
+                true_delta + abs(delta) * Float64(noise)
+            if score < best_score
+                best_state = proposed
+                best_delta = delta
+                best_true_delta = true_delta
+                best_score = score
+            end
+        end
+    end
+    return best_state, best_delta, best_true_delta, best_score
+end
+
 function _energy_batch(G::AbstractMatrix, h::AbstractVector, const_term::Real, values::AbstractMatrix)
     return vec(sum(values .* (G * values); dims=1)) .+ vec(sum(h .* values; dims=1)) .+ Float64(const_term)
 end
@@ -481,10 +516,13 @@ function _run_potts_subproblem(inst::MIMOPottsInstance, branch::MIMOPottsBranch,
     cycles_scaler::Real,
     noise_ratio::Real,
     noise_stepper::Symbol,
+    noise_coupling::Symbol=:directional,
     batch_rate::Real,
     eoffset::Real,
     rng::AbstractRNG,
+    record_trace::Bool=false,
 )
+    noise_coupling = _check_noise_coupling(noise_coupling)
     free_indices = branch.free_indices
     f = length(free_indices)
     levels = inst.levels
@@ -501,6 +539,7 @@ function _run_potts_subproblem(inst::MIMOPottsInstance, branch::MIMOPottsBranch,
     end
 
     G, h, const_term = _subproblem_terms(H, y, branch, const_offset, coupling_cache)
+    gdiag = Float64.(diag(G))
     noise_start = Float64(noise_ratio) * _gradient_bound(G, h, levels)
 
     states = Vector{Int}(undef, f)
@@ -522,6 +561,18 @@ function _run_potts_subproblem(inst::MIMOPottsInstance, branch::MIMOPottsBranch,
     end
 
     distance = _recompute_gradient_energy!(grad, gx, G, h, const_term, values)
+    initial_states = record_trace ? copy(states) : Int[]
+    trace_energy = record_trace ? Vector{Float64}(undef, steps + 1) : Float64[]
+    trace_changed_count = record_trace ? zeros(Int, steps) : Int[]
+    trace_changed_dimension = record_trace ? zeros(Int, steps) : Int[]
+    trace_old_state = record_trace ? zeros(Int, steps) : Int[]
+    trace_new_state = record_trace ? zeros(Int, steps) : Int[]
+    trace_states = record_trace ? Matrix{Int}(undef, f, steps + 1) : Matrix{Int}(undef, 0, 0)
+    trace_noise = record_trace ? Matrix{Float64}(undef, f, steps) : Matrix{Float64}(undef, 0, 0)
+    trace_true_delta = record_trace ? zeros(Float64, steps) : Float64[]
+    trace_noisy_score = record_trace ? zeros(Float64, steps) : Float64[]
+    record_trace && (trace_energy[1] = Float64(distance))
+    record_trace && (trace_states[:, 1] .= states)
     best_distance = distance
     step_found = 0
     dau_offset = 0.0
@@ -530,6 +581,11 @@ function _run_potts_subproblem(inst::MIMOPottsInstance, branch::MIMOPottsBranch,
 
     for step in 1:steps
         scale = _noise_scale(noise_stepper, noise_start, steps, step) + dau_offset
+        changed_this_step = 0
+        changed_dimension = 0
+        old_state = 0
+        new_state = 0
+        step_noisy_score = 0.0
 
         if optimizer === :batch || optimizer === :batchdau
             delta_count = 0
@@ -537,18 +593,14 @@ function _run_potts_subproblem(inst::MIMOPottsInstance, branch::MIMOPottsBranch,
             rand!(rng, mask_random)
             @inbounds for i in 1:f
                 noise = scale * (2.0 * noise_random[i] - 1.0)
-                direction = grad[i] < noise ? 1 : -1
-                proposed = states[i] + direction
-                if proposed < 1
-                    proposed = 1
-                elseif proposed > k
-                    proposed = k
-                end
+                proposed, delta, _, score = _best_adjacent_transition(
+                    grad[i], gdiag[i], states[i], values[i], levels, noise, noise_coupling)
                 if proposed != states[i] && mask_random[i] < batch_rate_f
                     delta_count += 1
                     delta_indices[delta_count] = i
-                    delta_values[delta_count] = Float64(levels[proposed]) - values[i]
+                    delta_values[delta_count] = delta
                     new_states[delta_count] = proposed
+                    step_noisy_score += score
                 end
             end
 
@@ -557,6 +609,7 @@ function _run_potts_subproblem(inst::MIMOPottsInstance, branch::MIMOPottsBranch,
             end
 
             if delta_count > 0
+                changed_this_step = delta_count
                 if f >= 32 || delta_count > max(4, f >>> 4)
                     _apply_state_deltas!(states, values, delta_indices, delta_values, new_states, delta_count)
                     distance = _recompute_gradient_energy!(grad, gx, G, h, const_term, values)
@@ -569,22 +622,19 @@ function _run_potts_subproblem(inst::MIMOPottsInstance, branch::MIMOPottsBranch,
             chosen_index = 0
             chosen_state = 0
             chosen_delta = 0.0
+            chosen_score = 0.0
             rand!(rng, noise_random)
             @inbounds for i in 1:f
                 noise = scale * (2.0 * noise_random[i] - 1.0)
-                direction = grad[i] < noise ? 1 : -1
-                proposed = states[i] + direction
-                if proposed < 1
-                    proposed = 1
-                elseif proposed > k
-                    proposed = k
-                end
+                proposed, delta, _, score = _best_adjacent_transition(
+                    grad[i], gdiag[i], states[i], values[i], levels, noise, noise_coupling)
                 if proposed != states[i]
                     changed_count += 1
                     if rand(rng, 1:changed_count) == 1
                         chosen_index = i
                         chosen_state = proposed
-                        chosen_delta = Float64(levels[proposed]) - values[i]
+                        chosen_delta = delta
+                        chosen_score = score
                     end
                 end
             end
@@ -595,10 +645,15 @@ function _run_potts_subproblem(inst::MIMOPottsInstance, branch::MIMOPottsBranch,
                 end
             else
                 dau_offset = 0.0
+                changed_this_step = 1
+                changed_dimension = free_indices[chosen_index]
+                old_state = states[chosen_index]
+                new_state = chosen_state
                 delta_indices[1] = chosen_index
                 delta_values[1] = chosen_delta
                 new_states[1] = chosen_state
                 distance += _apply_deltas!(grad, states, values, G, delta_indices, delta_values, new_states, 1)
+                step_noisy_score = chosen_score
             end
         else
             error("Unsupported MIMO Potts optimizer $(optimizer). Use :batch, :singleflip, :dau, or :batchdau.")
@@ -613,10 +668,146 @@ function _run_potts_subproblem(inst::MIMOPottsInstance, branch::MIMOPottsBranch,
             end
             distance = exact_distance
         end
+
+        if record_trace
+            trace_energy[step + 1] = _potts_energy(G, h, const_term, values)
+            trace_changed_count[step] = changed_this_step
+            trace_changed_dimension[step] = changed_dimension
+            trace_old_state[step] = old_state
+            trace_new_state[step] = new_state
+            trace_states[:, step + 1] .= states
+            trace_noise[:, step] .= scale .* (2.0 .* noise_random .- 1.0)
+            trace_true_delta[step] = trace_energy[step + 1] - trace_energy[step]
+            trace_noisy_score[step] = step_noisy_score
+        end
     end
 
     return (; best_distance = Float64(best_distance), best_free_states = Vector{Int}(best_states),
-        step_found = step_found, total_steps = steps, total_gradient_evals = steps)
+        final_free_states = Vector{Int}(states),
+        step_found = step_found, total_steps = steps, total_gradient_evals = steps,
+        trace = record_trace ? (;
+            initial_states,
+            energy = trace_energy,
+            changed_count = trace_changed_count,
+            changed_dimension = trace_changed_dimension,
+            old_state = trace_old_state,
+            new_state = trace_new_state,
+            states = trace_states,
+            noise = trace_noise,
+            true_delta = trace_true_delta,
+            noisy_score = trace_noisy_score,
+        ) : nothing)
+end
+
+"""
+    trace_mimo_potts(path; kwargs...)
+
+Run CPU MIMO Potts trials with every real-valued dimension free and record the
+exact current objective after every optimizer step. This diagnostic interface
+does not record the incumbent/best-so-far trajectory and does not alter update
+acceptance. It supports all CPU optimizers.
+"""
+function trace_mimo_potts(path::AbstractString;
+    snr_index::Int=1,
+    instance_index::Int=1,
+    modulation=nothing,
+    trials::Int=32,
+    num_cycles::Int=64,
+    cycles_scaler::Real=1.0,
+    noise_ratio::Real=0.0,
+    noise_stepper::Symbol=:linear,
+    noise_coupling::Symbol=:directional,
+    optimizer::Symbol=:singleflip,
+    batch_rate::Real=0.5,
+    eoffset::Real=0.0,
+    preprocess=:qr,
+    seed=20260612,
+)
+    optimizer in (:batch, :batchdau, :singleflip, :dau) ||
+        error("Unsupported trace optimizer $(optimizer)")
+    noise_coupling = _check_noise_coupling(noise_coupling)
+    trials > 0 || error("trials must be positive")
+
+    inst = load_mimo_potts_instance(path; snr_index, instance_index, modulation)
+    prep = zf_mmse_preprocess(inst)
+    geometry = _preprocessed_geometry(inst, preprocess)
+    free_dims = length(prep.base_states)
+    branches = build_mimo_potts_branches(inst, prep;
+        free_dims = free_dims,
+        fixed_candidates_per_dim = 1,
+        max_branches = 1,
+        H = geometry.H,
+        y = geometry.y,
+        const_offset = geometry.const_offset,
+    )
+    length(branches) == 1 || error("Expected one all-free branch, got $(length(branches))")
+    branch = only(branches)
+    isempty(branch.fixed_indices) || error("Trace branch unexpectedly contains fixed dimensions")
+    coupling_cache = _make_coupling_cache(
+        geometry.H, geometry.y, branch.free_indices, branch.fixed_indices,
+        geometry.const_offset, true,
+    )
+
+    trace_trials = Vector{NamedTuple}(undef, trials)
+    for trial in 1:trials
+        trial_seed = _trial_seed(seed, snr_index, instance_index, branch.rank, trial)
+        sub = _run_potts_subproblem(inst, branch, prep;
+            H = geometry.H,
+            y = geometry.y,
+            const_offset = geometry.const_offset,
+            coupling_cache = coupling_cache,
+            optimizer = optimizer,
+            num_cycles = num_cycles,
+            cycles_scaler = cycles_scaler,
+            noise_ratio = noise_ratio,
+            noise_stepper = noise_stepper,
+            noise_coupling = noise_coupling,
+            batch_rate = batch_rate,
+            eoffset = eoffset,
+            rng = MersenneTwister(trial_seed),
+            record_trace = true,
+        )
+        initial_values = states_to_values(sub.trace.initial_states, inst.levels)
+        final_values = states_to_values(sub.final_free_states, inst.levels)
+        trace_trials[trial] = (;
+            trial,
+            seed = trial_seed,
+            initial_states = sub.trace.initial_states,
+            final_states = sub.final_free_states,
+            initial_energy = mimo_distance(inst.H, inst.y, initial_values),
+            final_energy = mimo_distance(inst.H, inst.y, final_values),
+            energy = sub.trace.energy,
+            changed_count = sub.trace.changed_count,
+            changed_dimension = sub.trace.changed_dimension,
+            old_state = sub.trace.old_state,
+            new_state = sub.trace.new_state,
+            states = sub.trace.states,
+            noise = sub.trace.noise,
+            true_delta = sub.trace.true_delta,
+            noisy_score = sub.trace.noisy_score,
+        )
+    end
+
+    return (;
+        source = inst.source,
+        snr_index = inst.snr_index,
+        instance_index = inst.instance_index,
+        ebnodb = inst.ebnodb,
+        modulation = inst.modulation,
+        nt = inst.nt,
+        nr = inst.nr,
+        optimizer,
+        noise_ratio = Float64(noise_ratio),
+        noise_stepper,
+        noise_coupling,
+        eoffset = Float64(eoffset),
+        num_cycles,
+        cycles_scaler = Float64(cycles_scaler),
+        free_dims,
+        preprocess = geometry.preprocess,
+        base_distance = Float64(prep.base_distance),
+        trials = trace_trials,
+    )
 end
 
 function _run_potts_subproblem_batch_backend(::Val{:cpu}, inst::MIMOPottsInstance, branch::MIMOPottsBranch, prep;
@@ -629,6 +820,7 @@ function _run_potts_subproblem_batch_backend(::Val{:cpu}, inst::MIMOPottsInstanc
     cycles_scaler::Real,
     noise_ratio::Real,
     noise_stepper::Symbol,
+    noise_coupling::Symbol,
     batch_rate::Real,
     eoffset::Real,
     seeds::AbstractVector{UInt64},
@@ -646,6 +838,7 @@ function _run_potts_subproblem_batch_backend(::Val{:cpu}, inst::MIMOPottsInstanc
             cycles_scaler = cycles_scaler,
             noise_ratio = noise_ratio,
             noise_stepper = noise_stepper,
+            noise_coupling = noise_coupling,
             batch_rate = batch_rate,
             eoffset = eoffset,
             rng = MersenneTwister(seed),
@@ -664,6 +857,7 @@ function _run_potts_subproblem_branch_batch_backend(backend_val, inst::MIMOPotts
     cycles_scaler::Real,
     noise_ratio::Real,
     noise_stepper::Symbol,
+    noise_coupling::Symbol,
     batch_rate::Real,
     eoffset::Real,
     snr_index::Int,
@@ -686,6 +880,7 @@ function _run_potts_subproblem_branch_batch_backend(backend_val, inst::MIMOPotts
             cycles_scaler = cycles_scaler,
             noise_ratio = noise_ratio,
             noise_stepper = noise_stepper,
+            noise_coupling = noise_coupling,
             batch_rate = batch_rate,
             eoffset = eoffset,
             seeds = seeds,
@@ -716,6 +911,7 @@ function _solve_mimo_potts_batched(path::AbstractString, backend_val;
     cycles_scaler::Real,
     noise_ratio::Real,
     noise_stepper::Symbol,
+    noise_coupling::Symbol,
     optimizer::Symbol,
     batch_rate::Real,
     eoffset::Real,
@@ -725,8 +921,8 @@ function _solve_mimo_potts_batched(path::AbstractString, backend_val;
     gpuBatchSize::Int,
     gpuFloat::Type{<:AbstractFloat},
 )
-    if !(optimizer in (:batch, :batchdau))
-        error("backend=:cuda currently supports optimizer=:batch and optimizer=:batchdau. Use backend=:cpu for $(optimizer).")
+    if !(optimizer in (:batch, :batchdau, :singleflip, :dau))
+        error("Unsupported MIMO Potts optimizer $(optimizer). Use :batch, :singleflip, :dau, or :batchdau.")
     end
 
     inst = load_mimo_potts_instance(path; snr_index, instance_index, modulation)
@@ -795,6 +991,7 @@ function _solve_mimo_potts_batched(path::AbstractString, backend_val;
                 cycles_scaler = cycles_scaler,
                 noise_ratio = noise_ratio,
                 noise_stepper = noise_stepper,
+                noise_coupling = noise_coupling,
                 batch_rate = batch_rate,
                 eoffset = eoffset,
                 snr_index = snr_index,
@@ -860,6 +1057,7 @@ function _solve_mimo_potts_batched(path::AbstractString, backend_val;
         trials = trials,
         num_cycles = num_cycles,
         noise_ratio = Float64(noise_ratio),
+        noise_coupling = noise_coupling,
         cycles_scaler = Float64(cycles_scaler),
         free_dims = free_dims,
         initial_radius = Float64(prep.base_distance),
@@ -896,6 +1094,7 @@ function _run_cpu_trial(inst::MIMOPottsInstance, prep, geometry, branches, coupl
     cycles_scaler::Real,
     noise_ratio::Real,
     noise_stepper::Symbol,
+    noise_coupling::Symbol,
     batch_rate::Real,
     eoffset::Real,
 )
@@ -929,6 +1128,7 @@ function _run_cpu_trial(inst::MIMOPottsInstance, prep, geometry, branches, coupl
             cycles_scaler = cycles_scaler,
             noise_ratio = noise_ratio,
             noise_stepper = noise_stepper,
+            noise_coupling = noise_coupling,
             batch_rate = batch_rate,
             eoffset = eoffset,
             rng = rng,
@@ -978,6 +1178,7 @@ function solve_mimo_potts(path::AbstractString;
     cycles_scaler::Real=1.0,
     noise_ratio::Real=1.0,
     noise_stepper::Symbol=:linear,
+    noise_coupling::Symbol=:directional,
     optimizer::Symbol=:batch,
     batch_rate::Real=0.5,
     eoffset::Real=0.0,
@@ -989,6 +1190,7 @@ function solve_mimo_potts(path::AbstractString;
     gpuFloat::Type{<:AbstractFloat}=Float32,
     cpuThreads::Bool=true,
 )
+    noise_coupling = _check_noise_coupling(noise_coupling)
     backend_val = _check_mimo_backend(backend)
     if Symbol(backend) !== :cpu
         return _solve_mimo_potts_batched(path, backend_val;
@@ -1003,6 +1205,7 @@ function solve_mimo_potts(path::AbstractString;
             cycles_scaler = cycles_scaler,
             noise_ratio = noise_ratio,
             noise_stepper = noise_stepper,
+            noise_coupling = noise_coupling,
             optimizer = optimizer,
             batch_rate = batch_rate,
             eoffset = eoffset,
@@ -1052,6 +1255,7 @@ function solve_mimo_potts(path::AbstractString;
                     cycles_scaler = cycles_scaler,
                     noise_ratio = noise_ratio,
                     noise_stepper = noise_stepper,
+                    noise_coupling = noise_coupling,
                     batch_rate = batch_rate,
                     eoffset = eoffset,
                 )
@@ -1065,6 +1269,7 @@ function solve_mimo_potts(path::AbstractString;
                     cycles_scaler = cycles_scaler,
                     noise_ratio = noise_ratio,
                     noise_stepper = noise_stepper,
+                    noise_coupling = noise_coupling,
                     batch_rate = batch_rate,
                     eoffset = eoffset,
                 )
@@ -1115,6 +1320,7 @@ function solve_mimo_potts(path::AbstractString;
         trials = trials,
         num_cycles = num_cycles,
         noise_ratio = Float64(noise_ratio),
+        noise_coupling = noise_coupling,
         cycles_scaler = Float64(cycles_scaler),
         free_dims = free_dims,
         initial_radius = Float64(prep.base_distance),
@@ -1171,6 +1377,7 @@ function _shared_result_row(r::MIMOPottsSolveResult, run_id::Int)
         optimizer = String(r.optimizer),
         numCycles = r.num_cycles,
         noiseRatio = r.noise_ratio,
+        noiseCoupling = String(r.noise_coupling),
         cyclesScaler = r.cycles_scaler,
         freeDims = r.free_dims,
         initialRadius = r.initial_radius,
@@ -1329,6 +1536,7 @@ function curunanmimoinstance(instance_path::AbstractString;
     fixed_candidates_per_dim::Int = 2,
     max_branches::Int = 256,
     noise_stepper::Symbol = :linear,
+    noise_coupling::Symbol = :directional,
     batch_rate::Real = 0.5,
     eoffset::Real = 0.0,
     cacheCouplings::Bool = true,
@@ -1343,6 +1551,7 @@ function curunanmimoinstance(instance_path::AbstractString;
     gpuFloat::Type{<:AbstractFloat} = Float32,
     cpuThreads::Bool = true,
 )
+    noise_coupling = _check_noise_coupling(noise_coupling)
     format = Symbol(resultFormat)
     if !(format in (:flat, :compact))
         error("Unsupported MIMO Potts resultFormat $(resultFormat). Use :flat or :compact.")
@@ -1366,7 +1575,7 @@ function curunanmimoinstance(instance_path::AbstractString;
         for outer_trial in 1:trials
             run_counter += 1
             if showProgress
-                println("MIMO Potts run $(run_counter): runId=$(run_id), snr=$(snr_index), instance=$(instance_index), outerTrial=$(outer_trial), noiseRatio=$(noise_ratio), cyclesScaler=$(cycles_scaler), freeDims=$(free_dims), optimizer=$(optimizer)")
+                println("MIMO Potts run $(run_counter): runId=$(run_id), snr=$(snr_index), instance=$(instance_index), outerTrial=$(outer_trial), noiseRatio=$(noise_ratio), noiseCoupling=$(noise_coupling), cyclesScaler=$(cycles_scaler), freeDims=$(free_dims), optimizer=$(optimizer)")
             end
             run_seed = isnothing(seed) ? nothing : hash((seed, snr_index, instance_index, noise_ratio, cycles_scaler, free_dims, outer_trial))
             r = solve_mimo_potts(instance_path;
@@ -1381,6 +1590,7 @@ function curunanmimoinstance(instance_path::AbstractString;
                 cycles_scaler = cycles_scaler,
                 noise_ratio = noise_ratio,
                 noise_stepper = noise_stepper,
+                noise_coupling = noise_coupling,
                 optimizer = optimizer,
                 batch_rate = batch_rate,
                 eoffset = eoffset,
