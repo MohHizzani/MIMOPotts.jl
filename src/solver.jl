@@ -202,7 +202,28 @@ function load_mimo_potts_instance(path::AbstractString; snr_index::Int=1, instan
     )
 end
 
-function zf_mmse_preprocess(inst::MIMOPottsInstance)
+function _check_reliability_mode(reliability_mode)
+    mode = Symbol(reliability_mode)
+    mode in (:margin, :whitened) ||
+        error("Unsupported reliability_mode $(reliability_mode). Use :margin or :whitened.")
+    return mode
+end
+
+function _post_equalization_error_variance(H::AbstractMatrix, noise_variance::Real, base_decoder::Symbol)
+    A = Symmetric(transpose(H) * H)
+    if base_decoder === :mmse
+        A = Symmetric(Matrix(A) + Float64(noise_variance) * I(size(H, 2)))
+    end
+    Ainv = try
+        inv(A)
+    catch
+        pinv(Matrix(A))
+    end
+    return Float64(noise_variance) .* max.(diag(Ainv), eps())
+end
+
+function zf_mmse_preprocess(inst::MIMOPottsInstance; reliability_mode::Symbol=:margin)
+    reliability_mode = _check_reliability_mode(reliability_mode)
     H, y, levels = inst.H, inst.y, inst.levels
     zf_est = H \ y
     mmse_est = (transpose(H) * H + inst.noise_variance * I(size(H, 2))) \ (transpose(H) * y)
@@ -232,6 +253,10 @@ function zf_mmse_preprocess(inst::MIMOPottsInstance)
     @inbounds for i in eachindex(base_est)
         ds = sort(abs2.(levels .- base_est[i]))
         reliability[i] = length(ds) == 1 ? Inf : ds[2] - ds[1]
+    end
+    if reliability_mode === :whitened
+        err_var = _post_equalization_error_variance(H, inst.noise_variance, base_decoder)
+        reliability ./= err_var
     end
 
     zf_ber = detection_error_rates(zf_states, inst.x_true, levels)[1]
@@ -921,13 +946,14 @@ function _solve_mimo_potts_batched(path::AbstractString, backend_val;
     gpuBatchSize::Int,
     gpuFloat::Type{<:AbstractFloat},
     return_all_trials::Bool=false,
+    reliability_mode::Symbol=:margin,
 )
     if !(optimizer in (:batch, :batchdau, :singleflip, :dau))
         error("Unsupported MIMO Potts optimizer $(optimizer). Use :batch, :singleflip, :dau, or :batchdau.")
     end
 
     inst = load_mimo_potts_instance(path; snr_index, instance_index, modulation)
-    prep = zf_mmse_preprocess(inst)
+    prep = zf_mmse_preprocess(inst; reliability_mode = reliability_mode)
     geometry = _preprocessed_geometry(inst, preprocess)
     initial_radius = Float64(prep.base_distance)
     best_states = copy(prep.base_states)
@@ -1260,8 +1286,10 @@ function solve_mimo_potts(path::AbstractString;
     gpuBatchSize::Int=256,
     gpuFloat::Type{<:AbstractFloat}=Float32,
     cpuThreads::Bool=true,
+    reliability_mode::Symbol=:margin,
 )
     noise_coupling = _check_noise_coupling(noise_coupling)
+    reliability_mode = _check_reliability_mode(reliability_mode)
     backend_val = _check_mimo_backend(backend)
     if Symbol(backend) !== :cpu
         return _solve_mimo_potts_batched(path, backend_val;
@@ -1285,6 +1313,7 @@ function solve_mimo_potts(path::AbstractString;
             seed = seed,
             gpuBatchSize = gpuBatchSize,
             gpuFloat = gpuFloat,
+            reliability_mode = reliability_mode,
         )
     end
 
@@ -1295,7 +1324,7 @@ function solve_mimo_potts(path::AbstractString;
     try
 
     inst = load_mimo_potts_instance(path; snr_index, instance_index, modulation)
-    prep = zf_mmse_preprocess(inst)
+    prep = zf_mmse_preprocess(inst; reliability_mode = reliability_mode)
     geometry = _preprocessed_geometry(inst, preprocess)
     initial_radius = Float64(prep.base_distance)
 
@@ -1621,8 +1650,10 @@ function curunanmimoinstance(instance_path::AbstractString;
     gpuBatchSize::Int = 256,
     gpuFloat::Type{<:AbstractFloat} = Float32,
     cpuThreads::Bool = true,
+    reliabilityMode::Symbol = :margin,
 )
     noise_coupling = _check_noise_coupling(noise_coupling)
+    reliability_mode = _check_reliability_mode(reliabilityMode)
     format = Symbol(resultFormat)
     if !(format in (:flat, :compact))
         error("Unsupported MIMO Potts resultFormat $(resultFormat). Use :flat or :compact.")
@@ -1675,6 +1706,7 @@ function curunanmimoinstance(instance_path::AbstractString;
                     backend = backend,
                     gpuBatchSize = gpuBatchSize,
                     gpuFloat = gpuFloat,
+                    reliability_mode = reliability_mode,
                 )
 
                 if format === :flat
@@ -1721,6 +1753,7 @@ function curunanmimoinstance(instance_path::AbstractString;
                 gpuBatchSize = gpuBatchSize,
                 gpuFloat = gpuFloat,
                 return_all_trials = true,
+                reliability_mode = reliability_mode,
             )
 
             for (outer_trial, r) in enumerate(results)
