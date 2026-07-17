@@ -371,6 +371,173 @@ function build_mimo_potts_branches(inst::MIMOPottsInstance, prep; free_dims::Int
     ) for i in eachindex(branches)]
 end
 
+function _check_branch_strategy(branch_strategy)
+    strategy = Symbol(branch_strategy)
+    strategy in (:beam, :sphere) ||
+        error("Unsupported branch_strategy $(branch_strategy). Use :beam or :sphere.")
+    return strategy
+end
+
+# Sorted (ascending lower_bound) bounded leaf store; worst leaf is dropped once full.
+function _sphere_push_leaf!(leaves::Vector{Tuple{Float64, Vector{Int}}}, lb::Float64, states::Vector{Int}, max_branches::Int)
+    if length(leaves) >= max_branches && lb >= leaves[end][1]
+        return nothing
+    end
+    pos = searchsortedfirst(leaves, lb; by = first, lt = <)
+    insert!(leaves, pos, (lb, copy(states)))
+    length(leaves) > max_branches && pop!(leaves)
+    return nothing
+end
+
+"""
+    build_mimo_potts_branches_sphere(inst, prep; ...)
+
+Depth-first Schnorr-Euchner sphere enumeration of the fixed dimensions.
+Assigns all PAM levels per tree level with exact partial distances in QR
+coordinates, prunes on the (shrinking) radius, and descends until `free_dims`
+dimensions remain unassigned. Leaves become branches whose `lower_bound` is the
+exact projection bound used for per-trial pruning. The radius shrinks via
+Babai completion of the free dimensions at each leaf. Requires at least as
+many rows as columns; falls back to the beam builder otherwise.
+"""
+function build_mimo_potts_branches_sphere(inst::MIMOPottsInstance, prep; free_dims::Int, max_branches::Int=256, H=inst.H, y=inst.y, const_offset::Real=0.0, sphere_max_nodes::Int=2_000_000)
+    n = length(prep.base_states)
+    if size(H, 1) < n
+        @warn "branch_strategy=:sphere requires nr >= nt; falling back to :beam" size(H)
+        return build_mimo_potts_branches(inst, prep; free_dims = free_dims,
+            fixed_candidates_per_dim = length(inst.levels), max_branches = max_branches,
+            H = H, y = y, const_offset = const_offset)
+    end
+    f = clamp(free_dims, 0, n)
+    levels = Float64.(inst.levels)
+    k = length(levels)
+
+    order = sortperm(prep.reliability; rev = false)
+    free_indices = sort(order[1:f])
+    free_set = Set(free_indices)
+    fixed_order = [i for i in order if !(i in free_set)]
+    # Least reliable fixed dims sit deepest (columns f+1..); the most reliable are
+    # assigned first at the tree root (column n) for maximal pruning.
+    perm = vcat(free_indices, fixed_order)
+    fixed_indices = perm[(f + 1):n]
+
+    if f == n
+        lb = _branch_lower_bound(H, y, free_indices, Int[], Float64[]; const_offset = const_offset)
+        return [MIMOPottsBranch(rank = 1, free_indices = free_indices, fixed_indices = Int[],
+            fixed_states = Int[], fixed_values = Float64[], lower_bound = lb, proxy_distance = lb)]
+    end
+
+    fact = qr(H[:, perm])
+    R = Matrix{Float64}(fact.R)
+    qty = Vector{Float64}(fact.Q' * y)
+    q = qty[1:n]
+    tail_offset = length(qty) > n ? sum(abs2, @view qty[(n + 1):end]) : 0.0
+    total_offset = Float64(const_offset) + tail_offset
+
+    x = zeros(Float64, n)
+    state_idx = zeros(Int, n)
+    child_order = Matrix{Int}(undef, k, n)
+    child_pos = zeros(Int, n)
+    resid = zeros(Float64, n)
+    pd_above = zeros(Float64, n + 1)   # pd_above[i]: partial distance from levels i+1..n
+
+    enter_level! = function (i::Int)
+        ri = q[i]
+        @inbounds for j in (i + 1):n
+            ri -= R[i, j] * x[j]
+        end
+        resid[i] = ri
+        center = iszero(R[i, i]) ? 0.0 : ri / R[i, i]
+        child_order[:, i] .= sortperm(abs.(levels .- center))
+        child_pos[i] = 0
+        return nothing
+    end
+
+    leaves = Tuple{Float64, Vector{Int}}[]
+    radius_bound = nextfloat(Float64(prep.base_distance))
+    prune_bound() = min(radius_bound,
+        length(leaves) >= max_branches ? leaves[end][1] : Inf)
+
+    nodes = 0
+    aborted = false
+    i = n
+    enter_level!(i)
+    while i <= n
+        child_pos[i] += 1
+        if child_pos[i] > k
+            i += 1
+            continue
+        end
+        s = child_order[child_pos[i], i]
+        d = resid[i] - R[i, i] * levels[s]
+        pd_child = pd_above[i + 1] + d * d
+        nodes += 1
+        if nodes > sphere_max_nodes
+            aborted = true
+            break
+        end
+        if pd_child + total_offset >= prune_bound()
+            # Schnorr-Euchner order: remaining siblings only get worse.
+            i += 1
+            continue
+        end
+        x[i] = levels[s]
+        state_idx[i] = s
+        if i == f + 1
+            lb = pd_child + total_offset
+            _sphere_push_leaf!(leaves, lb, state_idx[(f + 1):n], max_branches)
+            full = pd_child
+            @inbounds for row in f:-1:1
+                ri = q[row]
+                for j in (row + 1):n
+                    ri -= R[row, j] * x[j]
+                end
+                unc = iszero(R[row, row]) ? 0.0 : ri / R[row, row]
+                x[row] = levels[nearest_level_index(unc, levels)]
+                dr = ri - R[row, row] * x[row]
+                full += dr * dr
+            end
+            full += total_offset
+            if full < radius_bound
+                radius_bound = nextfloat(full)
+            end
+        else
+            pd_above[i] = pd_child
+            i -= 1
+            enter_level!(i)
+        end
+    end
+    aborted && @warn "Sphere enumeration hit sphere_max_nodes; returning leaves collected so far" sphere_max_nodes length(leaves)
+
+    if isempty(leaves)
+        base_states_fixed = prep.base_states[fixed_indices]
+        lb = _branch_lower_bound(H, y, free_indices, fixed_indices,
+            states_to_values(base_states_fixed, levels); const_offset = const_offset)
+        push!(leaves, (lb, base_states_fixed))
+    end
+
+    return [MIMOPottsBranch(
+        rank = i,
+        free_indices = copy(free_indices),
+        fixed_indices = copy(fixed_indices),
+        fixed_states = leaves[i][2],
+        fixed_values = states_to_values(leaves[i][2], levels),
+        lower_bound = leaves[i][1],
+        proxy_distance = leaves[i][1],
+    ) for i in eachindex(leaves)]
+end
+
+function _build_mimo_potts_branches(inst::MIMOPottsInstance, prep; branch_strategy::Symbol, free_dims::Int, fixed_candidates_per_dim::Int, max_branches::Int, H, y, const_offset::Real, sphere_max_nodes::Int)
+    if branch_strategy === :sphere
+        return build_mimo_potts_branches_sphere(inst, prep; free_dims = free_dims,
+            max_branches = max_branches, H = H, y = y, const_offset = const_offset,
+            sphere_max_nodes = sphere_max_nodes)
+    end
+    return build_mimo_potts_branches(inst, prep; free_dims = free_dims,
+        fixed_candidates_per_dim = fixed_candidates_per_dim, max_branches = max_branches,
+        H = H, y = y, const_offset = const_offset)
+end
+
 function _noise_scale(noise_stepper::Symbol, noise_start::Real, num_steps::Real, step::Real)
     if noise_stepper === :linear
         return Float64(noise_start) * (1.0 - Float64(step) / Float64(num_steps))
@@ -947,6 +1114,8 @@ function _solve_mimo_potts_batched(path::AbstractString, backend_val;
     gpuFloat::Type{<:AbstractFloat},
     return_all_trials::Bool=false,
     reliability_mode::Symbol=:margin,
+    branch_strategy::Symbol=:beam,
+    sphere_max_nodes::Int=2_000_000,
 )
     if !(optimizer in (:batch, :batchdau, :singleflip, :dau))
         error("Unsupported MIMO Potts optimizer $(optimizer). Use :batch, :singleflip, :dau, or :batchdau.")
@@ -968,13 +1137,15 @@ function _solve_mimo_potts_batched(path::AbstractString, backend_val;
     branches_pruned = 0
     radius_updates = 0
 
-    branches = build_mimo_potts_branches(inst, prep;
+    branches = _build_mimo_potts_branches(inst, prep;
+        branch_strategy = branch_strategy,
         free_dims = free_dims,
         fixed_candidates_per_dim = fixed_candidates_per_dim,
         max_branches = max_branches,
         H = geometry.H,
         y = geometry.y,
         const_offset = geometry.const_offset,
+        sphere_max_nodes = sphere_max_nodes,
     )
     coupling_cache = isempty(branches) ? nothing : _make_coupling_cache(geometry.H, geometry.y, branches[1].free_indices, branches[1].fixed_indices, geometry.const_offset, cacheCouplings)
 
@@ -1287,9 +1458,12 @@ function solve_mimo_potts(path::AbstractString;
     gpuFloat::Type{<:AbstractFloat}=Float32,
     cpuThreads::Bool=true,
     reliability_mode::Symbol=:margin,
+    branch_strategy::Symbol=:beam,
+    sphere_max_nodes::Int=2_000_000,
 )
     noise_coupling = _check_noise_coupling(noise_coupling)
     reliability_mode = _check_reliability_mode(reliability_mode)
+    branch_strategy = _check_branch_strategy(branch_strategy)
     backend_val = _check_mimo_backend(backend)
     if Symbol(backend) !== :cpu
         return _solve_mimo_potts_batched(path, backend_val;
@@ -1314,6 +1488,8 @@ function solve_mimo_potts(path::AbstractString;
             gpuBatchSize = gpuBatchSize,
             gpuFloat = gpuFloat,
             reliability_mode = reliability_mode,
+            branch_strategy = branch_strategy,
+            sphere_max_nodes = sphere_max_nodes,
         )
     end
 
@@ -1328,13 +1504,15 @@ function solve_mimo_potts(path::AbstractString;
     geometry = _preprocessed_geometry(inst, preprocess)
     initial_radius = Float64(prep.base_distance)
 
-    branches = build_mimo_potts_branches(inst, prep;
+    branches = _build_mimo_potts_branches(inst, prep;
+        branch_strategy = branch_strategy,
         free_dims = free_dims,
         fixed_candidates_per_dim = fixed_candidates_per_dim,
         max_branches = max_branches,
         H = geometry.H,
         y = geometry.y,
         const_offset = geometry.const_offset,
+        sphere_max_nodes = sphere_max_nodes,
     )
     coupling_cache = isempty(branches) ? nothing : _make_coupling_cache(geometry.H, geometry.y, branches[1].free_indices, branches[1].fixed_indices, geometry.const_offset, cacheCouplings)
 
@@ -1651,9 +1829,12 @@ function curunanmimoinstance(instance_path::AbstractString;
     gpuFloat::Type{<:AbstractFloat} = Float32,
     cpuThreads::Bool = true,
     reliabilityMode::Symbol = :margin,
+    branchStrategy::Symbol = :beam,
+    sphereMaxNodes::Int = 2_000_000,
 )
     noise_coupling = _check_noise_coupling(noise_coupling)
     reliability_mode = _check_reliability_mode(reliabilityMode)
+    branch_strategy = _check_branch_strategy(branchStrategy)
     format = Symbol(resultFormat)
     if !(format in (:flat, :compact))
         error("Unsupported MIMO Potts resultFormat $(resultFormat). Use :flat or :compact.")
@@ -1707,6 +1888,8 @@ function curunanmimoinstance(instance_path::AbstractString;
                     gpuBatchSize = gpuBatchSize,
                     gpuFloat = gpuFloat,
                     reliability_mode = reliability_mode,
+                    branch_strategy = branch_strategy,
+                    sphere_max_nodes = sphereMaxNodes,
                 )
 
                 if format === :flat
@@ -1754,6 +1937,8 @@ function curunanmimoinstance(instance_path::AbstractString;
                 gpuFloat = gpuFloat,
                 return_all_trials = true,
                 reliability_mode = reliability_mode,
+                branch_strategy = branch_strategy,
+                sphere_max_nodes = sphereMaxNodes,
             )
 
             for (outer_trial, r) in enumerate(results)
